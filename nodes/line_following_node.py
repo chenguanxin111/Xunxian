@@ -232,84 +232,95 @@ def extract_line_centers_ipm(mask):
     if not fits:
         return [], [], 0.0, 0.0, clean_mask
 
-    # 修复单边分类致命 Bug：动态追踪上一帧中线，防止左右误判导致 200px 巨额跳变 (猛往左打的元凶！)
     expected_mid_x = getattr(state, 'last_ipm_mid_x', 300.0)
     
-    # 通过底部的 X 坐标对比上一帧中线，判断线在左还是右
-    left_fits = [f for f in fits if f['k'] * 550.0 + f['b'] < expected_mid_x]
-    right_fits = [f for f in fits if f['k'] * 550.0 + f['b'] >= expected_mid_x]
+    left_ipm_pts = []
+    right_ipm_pts = []
 
-    IPM_HALF_LANE_WIDTH = 200.0  # IPM 地面坐标系物理半车道宽 (200px)
+    for c in contours[:4]:
+        pts = c.reshape(-1, 1, 2).astype(np.float32).copy()
+        pts[:, 0, 0] = 639.0 - pts[:, 0, 0]  # 还原镜像
+        ipm_pts = cv2.perspectiveTransform(pts, IPM_MATRIX).reshape(-1, 2)
+        ipm_pts = ipm_pts[np.isfinite(ipm_pts).all(axis=1)]
+        ipm_pts = ipm_pts[(ipm_pts[:, 0] > -200) & (ipm_pts[:, 0] < 800) &
+                          (ipm_pts[:, 1] > 0) & (ipm_pts[:, 1] < 600)]
+                          
+        if len(ipm_pts) >= 10 and np.ptp(ipm_pts[:, 1]) > 40:
+            k, b = np.polyfit(ipm_pts[:, 1], ipm_pts[:, 0], 1)
+            # 过滤横向停止线
+            if abs(k) < 1.5:
+                # 使用该段轮廓向下延伸到底部的预测 X 来区分左右
+                bottom_x = k * 550.0 + b
+                if bottom_x < expected_mid_x:
+                    left_ipm_pts.extend(ipm_pts)
+                else:
+                    right_ipm_pts.extend(ipm_pts)
 
-    lf = max(left_fits, key=lambda f: f['span']) if left_fits else None
-    rf = max(right_fits, key=lambda f: f['span']) if right_fits else None
-
-    # 左右平行度与物理间距校验 (防止左右打架)
-    if lf and rf:
-        k_diff = abs(lf['k'] - rf['k'])
-        bottom_w = (rf['k'] * 550.0 + rf['b']) - (lf['k'] * 550.0 + lf['b'])
-        if k_diff > 0.35 or bottom_w < 250.0 or bottom_w > 550.0:
-            # 依赖更清晰的线，若差不多则优先保右边界
-            if abs(rf['k']) < abs(lf['k']) + 0.15:
-                lf = None
-            else:
-                rf = None
-
-    if lf and rf:
-        k_mid = (lf['k'] + rf['k']) / 2.0
-        b_mid = (lf['b'] + rf['b']) / 2.0
-    elif lf:
-        k_mid = lf['k']
-        b_mid = lf['b'] + IPM_HALF_LANE_WIDTH  # 左线单边，向右平移 200px
-    elif rf:
-        k_mid = rf['k']
-        b_mid = rf['b'] - IPM_HALF_LANE_WIDTH  # 右线单边，向左平移 200px
-    else:
+    if not left_ipm_pts and not right_ipm_pts:
         return [], [], 0.0, 0.0, clean_mask
 
-    # 记忆底部中线 X 坐标，供下一帧动态分类使用
-    state.last_ipm_mid_x = k_mid * 550.0 + b_mid
+    # 沿 Y 轴按步长向下聚合（完美借鉴去年从下往上扫点的思想，保留全部弯道曲率！）
+    IPM_HALF_LANE_WIDTH = 200.0
+    center_trajectory = []
+    
+    # 从车头 (590) 往前扫到远处 (50)
+    for y_bin in range(590, 50, -20):  
+        l_xs = [p[0] for p in left_ipm_pts if abs(p[1] - y_bin) <= 15]
+        r_xs = [p[0] for p in right_ipm_pts if abs(p[1] - y_bin) <= 15]
+        
+        cand_x = []
+        if l_xs: cand_x.append(np.mean(l_xs) + IPM_HALF_LANE_WIDTH)
+        if r_xs: cand_x.append(np.mean(r_xs) - IPM_HALF_LANE_WIDTH)
+        
+        if cand_x:
+            center_trajectory.append([np.mean(cand_x), float(y_bin)])
 
-    # 修复单边不转弯 Bug：强制把单边线在整个纵深范围内推导延伸，覆盖远端视距
-    y_min_mid = 100.0
-    y_max_mid = 590.0
+    if not center_trajectory:
+        return [], [], 0.0, 0.0, clean_mask
 
-    # 在鸟瞰图中生成近端与远端中线点集
-    y_steps = np.linspace(y_min_mid, y_max_mid, num=30)
-    ipm_mid_pts = np.float32([
-        [k_mid * y + b_mid, y] for y in y_steps
-    ]).reshape(-1, 1, 2)
-
-    # 近端误差 (小车正前方地面 Y_ipm in [400, 590])
-    near_ipm_xs = [p[0, 0] for p in ipm_mid_pts if p[0, 1] >= 400.0]
-    if not near_ipm_xs:
-        near_ipm_xs = [p[0, 0] for p in ipm_mid_pts]
-    center_error_near = float(np.mean(near_ipm_xs) - 300.0)
-    angle_error_near = float(math.degrees(math.atan2(-k_mid, 1.0)))
-
-    # 远端弯道预判误差 (前方 0.5~1 米处 Y_ipm in [100, 380])
-    far_ipm_pts = [p[0] for p in ipm_mid_pts if p[0, 1] <= 380.0]
-    if len(far_ipm_pts) >= 4:
-        far_xs = [p[0] for p in far_ipm_pts]
-        far_ys = [p[1] for p in far_ipm_pts]
-        k_far, _ = np.polyfit(far_ys, far_xs, 1)
-        angle_error_far = float(math.degrees(math.atan2(-k_far, 1.0)))
+    center_trajectory = np.array(center_trajectory)
+    
+    # 获取近端点 (车头最近的点) 和 远端点 (视野前方的点) - 完美复现去年逻辑！
+    first_point = center_trajectory[0]  # y 最大，离车最近
+    
+    # 取往前约一半距离的点作为远端点，计算大视距割线角
+    # 这样即使单边丢失，平移后的点也自带完美曲率，算出的割线角极大，能瞬间抱死弯道！
+    middle_idx = min(len(center_trajectory) - 1, max(1, len(center_trajectory) // 2))
+    middle_point = center_trajectory[middle_idx]
+    
+    # 在 IPM 坐标系中计算割线角 (Y是朝下的，所以前方向是 -Y)
+    # dx = 远端X - 近端X (往右为正)
+    # dy = 近端Y - 远端Y (前向为正)
+    dx = middle_point[0] - first_point[0]
+    dy = first_point[1] - middle_point[1]
+    
+    # 当视野极短 (只有 1 个点) 时，退化为 0
+    if dy < 10:
+        angle_error_deg = 0.0
     else:
-        angle_error_far = angle_error_near
+        angle_error_deg = math.degrees(math.atan2(dx, dy))
+        
+    # 计算近端位置误差
+    near_pts = center_trajectory[center_trajectory[:, 1] >= 400.0]
+    if len(near_pts) > 0:
+        center_error_near = float(np.mean(near_pts[:, 0]) - 300.0)
+    else:
+        center_error_near = float(first_point[0] - 300.0)
+        
+    # 动态记忆中线，防止下帧左右跳变
+    state.last_ipm_mid_x = float(first_point[0])
 
-    # 远近结合的“弯道前馈预判角度” (远端占 65% 权重，实现提前打方向)
-    presteer_angle_error = 0.65 * angle_error_far + 0.35 * angle_error_near
-
-    # 利用逆矩阵 IPM_INV_MATRIX 将鸟瞰图中线反向投影回相机原始视角
-    raw_mid_pts = cv2.perspectiveTransform(ipm_mid_pts, IPM_INV_MATRIX).reshape(-1, 2)
+    # 画图：利用逆矩阵 IPM_INV_MATRIX 将中线反向投影回相机原始视角
     overlay_centers = []
+    ipm_mid_pts = center_trajectory.reshape(-1, 1, 2)
+    raw_mid_pts = cv2.perspectiveTransform(ipm_mid_pts, IPM_INV_MATRIX).reshape(-1, 2)
     for x, y in raw_mid_pts:
         ox = int(round(639.0 - x))  # 镜像恢复
         oy = int(round(y))
         if 0 <= ox < w and 0 <= oy < h:
             overlay_centers.append((ox, oy))
 
-    return overlay_centers, [], presteer_angle_error, center_error_near, clean_mask
+    return overlay_centers, [], float(angle_error_deg), float(center_error_near), clean_mask
 
 
 def extract_line_centers_fallback(mask):
