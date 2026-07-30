@@ -386,21 +386,19 @@ def control_timer(_event):
         state.delta_angular_z = angular_z - state.last_angular_z
         state.last_angular_z = angular_z
 
-        # 横向微调 (vy 修正)
-        kp_y = 12.0
-        linear_y = kp_y * center_err * 0.0005 if abs(center_err) > 10 else 0.0
+        # 去掉 y 方向斜向平移，保持纯粹的前进 linear.x 与转向 angular.z 运动
+        linear_y = 0.0
 
         # 限幅保护
         angular_z = max(-0.8, min(0.8, angular_z))
-        linear_y = max(-0.10, min(0.10, linear_y))
 
         cmd = Twist()
         cmd.linear.x = target_speed
-        cmd.linear.y = linear_y
+        cmd.linear.y = 0.0
         cmd.angular.z = angular_z
 
         state.command_linear_x = cmd.linear.x
-        state.command_linear_y = cmd.linear.y
+        state.command_linear_y = 0.0
         state.command_angular_z = cmd.angular.z
 
         cmd_pub.publish(cmd)
