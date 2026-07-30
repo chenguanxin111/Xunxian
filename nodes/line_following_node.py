@@ -293,9 +293,9 @@ def image_cb(msg):
             state.centers = centers
             state.angle_error = angle_error
             state.center_error = center_error
+            current_mode = state.mode
 
-        status = state.status()
-        cv2.putText(overlay, 'MODE: %s' % status['mode'], (10, 25),
+        cv2.putText(overlay, 'MODE: %s' % current_mode, (10, 25),
                     cv2.FONT_HERSHEY_SIMPLEX, .6, (0, 255, 255), 2)
         cv2.putText(overlay, 'angle_err=%.1f deg  center_err=%.1f px' %
                     (angle_error, center_error),
