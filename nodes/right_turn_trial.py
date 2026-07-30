@@ -964,7 +964,7 @@ def control_timer(_event):
                 # of about +14 deg. Use only the residual; otherwise that bias
                 # overwhelms the lateral term and incorrectly commands left.
                 heading_error = heading_raw - ROW_GUIDE_HEADING_TARGET_DEG
-                rot = (-0.35 * math.radians(heading_error) -
+                rot = (-0.20 * math.radians(heading_error) -
                        0.0006 * center_error)
                 cmd.linear.x = ALIGN_SPEED
                 cmd.angular.z = max(-0.08, min(0.08, rot))
