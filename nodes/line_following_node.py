@@ -38,16 +38,16 @@ DEFAULT_HSV = {
     'blur_ksize': 3,
     'erode_iter': 1, 'erode_ksize': 1,
     'dilate_iter': 2, 'dilate_ksize': 5,
-    'roi_top': 0.55, 'roi_bottom': 1.0,
+    'roi_top': 0.6, 'roi_bottom': 1.0,
     'roi_left': 0.0, 'roi_right': 1.0,
 }
 
-# 动态 PID 参数配置 (衍生自去年 xunxian.py 实测增益)
+# 动态 PID 参数配置 (借鉴去年 xunxian.py 增益 + 入弯前瞻灵敏度提升)
 PID_TABLE = {
-    'straight': (0.015, 0.22),     # 小转角平稳直行 (Kp_z, Kd_z)
-    'curve_small': (0.022, 0.18),  # 缓弯
-    'curve_medium': (0.026, 0.16), # 中弯
-    'curve_large': (0.030, 0.12),  # 急弯
+    'straight': (0.028, 0.22),     # 提升入弯初始灵敏度 (Kp_z 从 0.015 提升至 0.028)
+    'curve_small': (0.034, 0.18),  # 缓弯入弯前瞻预判
+    'curve_medium': (0.038, 0.16), # 中弯
+    'curve_large': (0.044, 0.12),  # 急弯大角度抱弯
 }
 
 
@@ -257,18 +257,31 @@ def extract_line_centers_ipm(mask):
     else:
         return [], [], 0.0, 0.0, clean_mask
 
-    # 在鸟瞰图中生成中线点集
+    # 在鸟瞰图中生成近端与远端中线点集
     y_steps = np.linspace(y_min_mid, y_max_mid, num=30)
     ipm_mid_pts = np.float32([
         [k_mid * y + b_mid, y] for y in y_steps
     ]).reshape(-1, 1, 2)
 
-    # IPM 空间下的近处误差与航向角偏角
-    near_ipm_xs = [p[0, 0] for p in ipm_mid_pts if p[0, 1] >= 450.0]
+    # 近端误差 (小车正前方地面 Y_ipm in [400, 590])
+    near_ipm_xs = [p[0, 0] for p in ipm_mid_pts if p[0, 1] >= 400.0]
     if not near_ipm_xs:
         near_ipm_xs = [p[0, 0] for p in ipm_mid_pts]
-    center_error_ipm = float(np.mean(near_ipm_xs) - 300.0)
-    angle_error_ipm = float(math.degrees(math.atan2(-k_mid, 1.0)))
+    center_error_near = float(np.mean(near_ipm_xs) - 300.0)
+    angle_error_near = float(math.degrees(math.atan2(-k_mid, 1.0)))
+
+    # 远端弯道预判误差 (前方 0.5~1 米处 Y_ipm in [100, 380])
+    far_ipm_pts = [p[0] for p in ipm_mid_pts if p[0, 1] <= 380.0]
+    if len(far_ipm_pts) >= 4:
+        far_xs = [p[0] for p in far_ipm_pts]
+        far_ys = [p[1] for p in far_ipm_pts]
+        k_far, _ = np.polyfit(far_ys, far_xs, 1)
+        angle_error_far = float(math.degrees(math.atan2(-k_far, 1.0)))
+    else:
+        angle_error_far = angle_error_near
+
+    # 远近结合的“弯道前馈预判角度” (远端占 65% 权重，实现提前打方向)
+    presteer_angle_error = 0.65 * angle_error_far + 0.35 * angle_error_near
 
     # 利用逆矩阵 IPM_INV_MATRIX 将鸟瞰图中线反向投影回相机原始视角
     raw_mid_pts = cv2.perspectiveTransform(ipm_mid_pts, IPM_INV_MATRIX).reshape(-1, 2)
@@ -279,7 +292,7 @@ def extract_line_centers_ipm(mask):
         if 0 <= ox < w and 0 <= oy < h:
             overlay_centers.append((ox, oy))
 
-    return overlay_centers, [], angle_error_ipm, center_error_ipm, clean_mask
+    return overlay_centers, [], presteer_angle_error, center_error_near, clean_mask
 
 
 def extract_line_centers_fallback(mask):
@@ -381,19 +394,22 @@ def control_timer(_event):
         else:
             kp_z, kd_z = PID_TABLE['curve_large']
 
-        # 去年 proven 的动态 PD 角速度控制算法
-        angular_z = kp_z * angle_err - kd_z * state.delta_angular_z
+        # 动态 PD 角速度控制算法 + 近处偏离修正
+        angular_z = kp_z * angle_err - kd_z * state.delta_angular_z - 0.0012 * center_err
         state.delta_angular_z = angular_z - state.last_angular_z
         state.last_angular_z = angular_z
 
-        # 去掉 y 方向斜向平移，保持纯粹的前进 linear.x 与转向 angular.z 运动
-        linear_y = 0.0
+        # 弯道动态速度适应：当预判到前方弯道曲率增大 (>12°) 时，平滑适度降速给足转向抓地力
+        if abs_angle > 12.0:
+            current_speed = max(0.18, target_speed - 0.003 * (abs_angle - 12.0))
+        else:
+            current_speed = target_speed
 
         # 限幅保护
-        angular_z = max(-0.8, min(0.8, angular_z))
+        angular_z = max(-0.85, min(0.85, angular_z))
 
         cmd = Twist()
-        cmd.linear.x = target_speed
+        cmd.linear.x = current_speed
         cmd.linear.y = 0.0
         cmd.angular.z = angular_z
 
