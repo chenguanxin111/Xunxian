@@ -378,8 +378,8 @@ def control_timer(_event):
         else:
             kp_z, kd_z = PID_TABLE['curve_large']
 
-        # 动态 PD 角速度控制算法 + 近处偏离修正 (修复横向偏差正反馈误打方向)
-        angular_z = kp_z * angle_err - kd_z * state.delta_angular_z + 0.0012 * center_err
+        # 动态 PD 角速度控制算法 (完全匹配去年 xunxian.py 纯角度驱动算法，消除横向偏差干扰)
+        angular_z = kp_z * angle_err - kd_z * state.delta_angular_z
         state.delta_angular_z = angular_z - state.last_angular_z
         state.last_angular_z = angular_z
 
