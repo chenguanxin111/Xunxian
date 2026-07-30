@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.log
+.vscode/
+.antigravity/
+check_err.py
+test_poly.py
+test_cvbridge.py

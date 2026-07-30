@@ -1,0 +1,16 @@
+启动ifly2025虚拟环境：
+source /opt/ros/noetic/setup.bash
+conda activate fly2025
+启动摄像头/web订阅：
+roslaunch usb_cam usb_cam-test.launch
+rosrun web_video_server web_video_server
+编译controller：
+cd ~/ucar26_ws
+catkin_make -DCATKIN_WHITELIST_PACKAGES="ucar_controller;ydlidar;ucar_map;ucar_nav"
+启动底盘：
+source devel/setup.bash
+roslaunch ucar_controller base_driver.launch
+启动键盘控制：
+source /opt/ros/noetic/setup.bash
+source ~/ucar26_ws/devel/setup.bash
+rosrun teleop_twist_keyboard teleop_twist_keyboard.py
