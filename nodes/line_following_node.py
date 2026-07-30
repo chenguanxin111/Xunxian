@@ -189,109 +189,72 @@ def init_ipm():
 def extract_line_centers_ipm(mask):
     """
     在鸟瞰图 (IPM) 地面物理坐标系下提取双边/单边中线：
-    采用中心向外扩散扫描 (Sliding Window) 屏蔽外侧干扰板与横向停止线，
-    并加入平行度校验与右边界优先兜底逻辑。
+    单边丢失时，在 IPM 空间平移 200px (物理半车道宽度)，并通过 IPM_INV_MATRIX
+    反向投影回相机原始视角，绘制符合透视画面的流畅绿色中线。
     """
     if IPM_MATRIX is None or IPM_INV_MATRIX is None:
         return extract_line_centers_fallback(mask)
 
     h, w = mask.shape
-    # 还原镜像，以匹配 IPM 标定矩阵的坐标系
-    mask_unflipped = cv2.flip(mask, 1)
+    result = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    contours = result[0] if len(result) == 2 else result[1]
+    contours = [c for c in contours if cv2.contourArea(c) > 120]
     
-    # 1. 整体透视变换至 600x600 的鸟瞰二值图
-    mask_ipm = cv2.warpPerspective(mask_unflipped, IPM_MATRIX, (600, 600), flags=cv2.INTER_NEAREST)
-    clean_mask_ipm = np.zeros_like(mask_ipm)
+    if not contours:
+        return [], [], 0.0, 0.0, np.zeros_like(mask)
 
-    left_pts = []
-    right_pts = []
+    contours.sort(key=lambda c: cv2.contourArea(c), reverse=True)
     
-    # 预期底部中心 (600 宽的图中，300 为中心)
-    expected_mid_x = 300
-    if hasattr(state, 'last_ipm_mid_x') and state.last_ipm_mid_x is not None:
-        expected_mid_x = state.last_ipm_mid_x
+    clean_mask = np.zeros_like(mask)
+    cv2.drawContours(clean_mask, contours[:4], -1, 255, -1)
 
-    step = 10
-    # 2. 从下往上，由中向外扩散扫描
-    for y in range(590, 50, -step):
-        white_indices = np.where(mask_ipm[y] > 128)[0]
-        if len(white_indices) == 0:
-            continue
-            
-        diff = np.diff(white_indices)
-        breaks = np.where(diff > 1)[0] + 1
-        clusters = np.split(white_indices, breaks)
-        
-        # 横线过滤：若单个色块横向连续超过 150px (对应物理极宽)，判定为停止线或大白板，直接抛弃
-        clusters = [c for c in clusters if len(c) < 150]
-        if not clusters:
-            continue
-            
-        means = [int(np.mean(c)) for c in clusters]
-        
-        # 向左、向右找最近的内侧边缘，完美无视外围干扰！
-        left_candidates = [x for x in means if x <= expected_mid_x]
-        left_edge = max(left_candidates) if left_candidates else None
-        
-        right_candidates = [x for x in means if x > expected_mid_x]
-        right_edge = min(right_candidates) if right_candidates else None
-        
-        # 物理车道宽度校验 (~400px 间距)
-        if left_edge is not None and right_edge is not None:
-            w_ipm = right_edge - left_edge
-            if 300 <= w_ipm <= 500:
-                expected_mid_x = int((left_edge + right_edge) / 2)
-            else:
-                # 宽度异常，说明某一边碰到了噪点，丢弃距离预期边界(±200)更远的那一边
-                dist_l = abs(left_edge - (expected_mid_x - 200))
-                dist_r = abs(right_edge - (expected_mid_x + 200))
-                if dist_l < dist_r:
-                    right_edge = None
-                else:
-                    left_edge = None
-                    
-        if left_edge is not None:
-            left_pts.append((left_edge, y))
-            cv2.circle(clean_mask_ipm, (left_edge, y), 5, 255, -1)
-        if right_edge is not None:
-            right_pts.append((right_edge, y))
-            cv2.circle(clean_mask_ipm, (right_edge, y), 5, 255, -1)
-            
-        # 补偿单边预期中心
-        if left_edge is not None and right_edge is None:
-            expected_mid_x = left_edge + 200
-        elif right_edge is not None and left_edge is None:
-            expected_mid_x = right_edge - 200
+    # 将轮廓转换为鸟瞰图 (IPM) 点集
+    fits = []
+    for c in contours[:4]:
+        pts = c.reshape(-1, 1, 2).astype(np.float32).copy()
+        pts[:, 0, 0] = 639.0 - pts[:, 0, 0]  # 还原镜像
+        ipm_pts = cv2.perspectiveTransform(pts, IPM_MATRIX).reshape(-1, 2)
+        ipm_pts = ipm_pts[np.isfinite(ipm_pts).all(axis=1)]
+        ipm_pts = ipm_pts[(ipm_pts[:, 0] > -200) & (ipm_pts[:, 0] < 800) &
+                          (ipm_pts[:, 1] > 0) & (ipm_pts[:, 1] < 600)]
+        if len(ipm_pts) >= 10 and np.ptp(ipm_pts[:, 1]) > 40:
+            k, b = np.polyfit(ipm_pts[:, 1], ipm_pts[:, 0], 1)
+            # 1. 绝对斜率过滤：真正的车道线在鸟瞰图中应朝向正前方 (|k| < 1.2)
+            # 排除横向停止线、大白板横向边缘 (|k| > 1.2)
+            if abs(k) < 1.2:
+                fits.append({
+                    'k': float(k), 'b': float(b),
+                    'y_min': float(np.min(ipm_pts[:, 1])),
+                    'y_max': float(np.max(ipm_pts[:, 1])),
+                    'span': float(np.ptp(ipm_pts[:, 1])),
+                    'contour': c
+                })
 
-    # 3. 拟合直线
-    lf = rf = None
-    if len(left_pts) >= 6:
-        ys = [p[1] for p in left_pts]
-        xs = [p[0] for p in left_pts]
-        if np.ptp(ys) > 40:
-            k, b = np.polyfit(ys, xs, 1)
-            lf = {'k': float(k), 'b': float(b), 'y_min': min(ys), 'y_max': max(ys)}
-            
-    if len(right_pts) >= 6:
-        ys = [p[1] for p in right_pts]
-        xs = [p[0] for p in right_pts]
-        if np.ptp(ys) > 40:
-            k, b = np.polyfit(ys, xs, 1)
-            rf = {'k': float(k), 'b': float(b), 'y_min': min(ys), 'y_max': max(ys)}
+    if not fits:
+        return [], [], 0.0, 0.0, clean_mask
 
-    IPM_HALF_LANE_WIDTH = 200.0
-    k_mid, b_mid, y_min_mid, y_max_mid = None, None, 590.0, 590.0
-    
+    # 区分左右车道线 (IPM 图像宽度为 600，中心 300)
+    left_fits = [f for f in fits if f['k'] * f['y_max'] + f['b'] < 320.0]
+    right_fits = [f for f in fits if f['k'] * f['y_max'] + f['b'] >= 320.0]
+
+    IPM_HALF_LANE_WIDTH = 200.0  # IPM 地面坐标系物理半车道宽 (200px)
+
+    lf = max(left_fits, key=lambda f: f['span']) if left_fits else None
+    rf = max(right_fits, key=lambda f: f['span']) if right_fits else None
+
+    # 2. 左右平行度与物理车道宽度校验
     if lf and rf:
-        # 平行度校验 (左右边界斜率差值阈值 0.25)
-        if abs(lf['k'] - rf['k']) > 0.25:
-            # 左右打架！环境复杂时更依赖清晰的右边界 (Right-Boundary Priority)
-            # 或者选择绝对斜率更小(更接近纵向直行)的一条，强制降级丢弃假线！
-            if abs(rf['k']) < abs(lf['k']) + 0.2:
-                lf = None
+        k_diff = abs(lf['k'] - rf['k'])
+        bottom_w = (rf['k'] * 550.0 + rf['b']) - (lf['k'] * 550.0 + lf['b'])
+        
+        # 斜率差值阈值 0.25 (平行度检测) 或 底部间距异常
+        if k_diff > 0.25 or bottom_w < 250.0 or bottom_w > 550.0:
+            # 左右打架或间距异常！依赖清晰的右边界 (Right-Boundary Priority)
+            if abs(rf['k']) < abs(lf['k']) + 0.15:
+                lf = None  # 放弃假左线，降级为单右线推算
             else:
-                rf = None
-                
+                rf = None  # 放弃假右线
+
     if lf and rf:
         k_mid = (lf['k'] + rf['k']) / 2.0
         b_mid = (lf['b'] + rf['b']) / 2.0
@@ -299,24 +262,18 @@ def extract_line_centers_ipm(mask):
         y_max_mid = min(590.0, max(lf['y_max'], rf['y_max']))
     elif lf:
         k_mid = lf['k']
-        b_mid = lf['b'] + IPM_HALF_LANE_WIDTH
+        b_mid = lf['b'] + IPM_HALF_LANE_WIDTH  # 左线单边，向右平移 200px
         y_min_mid = lf['y_min']
-        y_max_mid = min(590.0, max(450.0, lf['y_max']))
+        y_max_mid = min(590.0, max(550.0, lf['y_max']))
     elif rf:
         k_mid = rf['k']
-        b_mid = rf['b'] - IPM_HALF_LANE_WIDTH
+        b_mid = rf['b'] - IPM_HALF_LANE_WIDTH  # 右线单边，向左平移 200px
         y_min_mid = rf['y_min']
-        y_max_mid = min(590.0, max(450.0, rf['y_max']))
+        y_max_mid = min(590.0, max(550.0, rf['y_max']))
     else:
-        # 兜底：反投影返回
-        clean_mask_raw = cv2.warpPerspective(clean_mask_ipm, IPM_INV_MATRIX, (w, h))
-        clean_mask_raw = cv2.flip(clean_mask_raw, 1)
-        return [], [], 0.0, 0.0, clean_mask_raw
+        return [], [], 0.0, 0.0, clean_mask
 
-    # 记忆底部中心
-    state.last_ipm_mid_x = int(k_mid * 590.0 + b_mid)
-    
-    # 4. 生成中线与反向投影
+    # 在鸟瞰图中生成近端与远端中线点集
     y_steps = np.linspace(y_min_mid, y_max_mid, num=30)
     ipm_mid_pts = np.float32([
         [k_mid * y + b_mid, y] for y in y_steps
@@ -339,12 +296,8 @@ def extract_line_centers_ipm(mask):
     else:
         angle_error_far = angle_error_near
 
-    # 远近结合的“弯道前馈预判角度”
+    # 远近结合的“弯道前馈预判角度” (远端占 65% 权重，实现提前打方向)
     presteer_angle_error = 0.65 * angle_error_far + 0.35 * angle_error_near
-
-    # 还原鸟瞰图上画出的有效边线采样点
-    clean_mask_raw = cv2.warpPerspective(clean_mask_ipm, IPM_INV_MATRIX, (w, h))
-    clean_mask_raw = cv2.flip(clean_mask_raw, 1)
 
     # 利用逆矩阵 IPM_INV_MATRIX 将鸟瞰图中线反向投影回相机原始视角
     raw_mid_pts = cv2.perspectiveTransform(ipm_mid_pts, IPM_INV_MATRIX).reshape(-1, 2)
@@ -355,7 +308,7 @@ def extract_line_centers_ipm(mask):
         if 0 <= ox < w and 0 <= oy < h:
             overlay_centers.append((ox, oy))
 
-    return overlay_centers, [], presteer_angle_error, center_error_near, clean_mask_raw
+    return overlay_centers, [], presteer_angle_error, center_error_near, clean_mask
 
 
 def extract_line_centers_fallback(mask):
