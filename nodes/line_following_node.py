@@ -165,96 +165,133 @@ def make_mask(frame, params):
     return roi, (x1, y1, x2, y2)
 
 
-def extract_line_centers(mask):
+PERSP_PATH = os.path.join(PROJECT_DIR, 'config', 'perspective_params.json')
+
+IPM_MATRIX = None
+IPM_INV_MATRIX = None
+
+
+def init_ipm():
+    global IPM_MATRIX, IPM_INV_MATRIX
+    if os.path.exists(PERSP_PATH):
+        try:
+            with open(PERSP_PATH, 'r') as f:
+                data = json.load(f)
+                src_pts = np.float32(data['src_points'])
+                dst_pts = np.float32(data['dst_points'])
+                IPM_MATRIX = cv2.getPerspectiveTransform(src_pts, dst_pts)
+                IPM_INV_MATRIX = cv2.getPerspectiveTransform(dst_pts, src_pts)
+                rospy.loginfo("巡线节点成功载入鸟瞰图 (IPM) 正向及反向矩阵: %s", PERSP_PATH)
+        except Exception as err:
+            rospy.logwarn("巡线节点读取 IPM 配置文件失败: %s", err)
+
+
+def extract_line_centers_ipm(mask):
     """
-    继承去年 xunxian.py 的逐行扫描算法：
-    从图像最底部向上以 step=4 逐行扫描二值化连通块，提取多边/双边/单边中线点集。
+    在鸟瞰图 (IPM) 地面物理坐标系下提取双边/单边中线：
+    单边丢失时，在 IPM 空间平移 200px (物理半车道宽度)，并通过 IPM_INV_MATRIX
+    反向投影回相机原始视角，绘制符合透视画面的流畅绿色中线。
     """
+    if IPM_MATRIX is None or IPM_INV_MATRIX is None:
+        return extract_line_centers_fallback(mask)
+
     h, w = mask.shape
-    centers = []
-    edge_samples = []
-    
-    # 清理掩膜主要轮廓，避免杂噪点干扰
     result = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     contours = result[0] if len(result) == 2 else result[1]
     contours = [c for c in contours if cv2.contourArea(c) > 120]
-    clean_mask = np.zeros_like(mask)
-    if contours:
-        cv2.drawContours(clean_mask, contours, -1, 255, -1)
+    
+    if not contours:
+        return [], [], 0.0, 0.0, np.zeros_like(mask)
 
+    contours.sort(key=lambda c: cv2.contourArea(c), reverse=True)
+    
+    clean_mask = np.zeros_like(mask)
+    cv2.drawContours(clean_mask, contours[:4], -1, 255, -1)
+
+    # 将轮廓转换为鸟瞰图 (IPM) 点集
+    fits = []
+    for c in contours[:4]:
+        pts = c.reshape(-1, 1, 2).astype(np.float32).copy()
+        pts[:, 0, 0] = 639.0 - pts[:, 0, 0]  # 还原镜像
+        ipm_pts = cv2.perspectiveTransform(pts, IPM_MATRIX).reshape(-1, 2)
+        ipm_pts = ipm_pts[np.isfinite(ipm_pts).all(axis=1)]
+        ipm_pts = ipm_pts[(ipm_pts[:, 0] > -200) & (ipm_pts[:, 0] < 800) &
+                          (ipm_pts[:, 1] > 0) & (ipm_pts[:, 1] < 600)]
+        if len(ipm_pts) >= 10 and np.ptp(ipm_pts[:, 1]) > 40:
+            k, b = np.polyfit(ipm_pts[:, 1], ipm_pts[:, 0], 1)
+            fits.append({
+                'k': float(k), 'b': float(b),
+                'y_min': float(np.min(ipm_pts[:, 1])),
+                'y_max': float(np.max(ipm_pts[:, 1])),
+                'contour': c
+            })
+
+    if not fits:
+        return [], [], 0.0, 0.0, clean_mask
+
+    # 区分左右车道线 (IPM 图像宽度为 600，中心 300)
+    left_fits = [f for f in fits if f['k'] * f['y_max'] + f['b'] < 320.0]
+    right_fits = [f for f in fits if f['k'] * f['y_max'] + f['b'] >= 320.0]
+
+    IPM_HALF_LANE_WIDTH = 200.0  # IPM 地面坐标系物理半车道宽 (200px)
+
+    if left_fits and right_fits:
+        lf = max(left_fits, key=lambda f: f['y_max'] - f['y_min'])
+        rf = max(right_fits, key=lambda f: f['y_max'] - f['y_min'])
+        k_mid = (lf['k'] + rf['k']) / 2.0
+        b_mid = (lf['b'] + rf['b']) / 2.0
+        y_min_mid = max(lf['y_min'], rf['y_min'])
+        y_max_mid = min(590.0, max(lf['y_max'], rf['y_max']))
+    elif left_fits:
+        lf = max(left_fits, key=lambda f: f['y_max'] - f['y_min'])
+        k_mid = lf['k']
+        b_mid = lf['b'] + IPM_HALF_LANE_WIDTH  # 左线单边，向右平移 200px
+        y_min_mid = lf['y_min']
+        y_max_mid = min(590.0, max(550.0, lf['y_max']))
+    elif right_fits:
+        rf = max(right_fits, key=lambda f: f['y_max'] - f['y_min'])
+        k_mid = rf['k']
+        b_mid = rf['b'] - IPM_HALF_LANE_WIDTH  # 右线单边，向左平移 200px
+        y_min_mid = rf['y_min']
+        y_max_mid = min(590.0, max(550.0, rf['y_max']))
+    else:
+        return [], [], 0.0, 0.0, clean_mask
+
+    # 在鸟瞰图中生成中线点集
+    y_steps = np.linspace(y_min_mid, y_max_mid, num=30)
+    ipm_mid_pts = np.float32([
+        [k_mid * y + b_mid, y] for y in y_steps
+    ]).reshape(-1, 1, 2)
+
+    # IPM 空间下的近处误差与航向角偏角
+    near_ipm_xs = [p[0, 0] for p in ipm_mid_pts if p[0, 1] >= 450.0]
+    if not near_ipm_xs:
+        near_ipm_xs = [p[0, 0] for p in ipm_mid_pts]
+    center_error_ipm = float(np.mean(near_ipm_xs) - 300.0)
+    angle_error_ipm = float(math.degrees(math.atan2(-k_mid, 1.0)))
+
+    # 利用逆矩阵 IPM_INV_MATRIX 将鸟瞰图中线反向投影回相机原始视角
+    raw_mid_pts = cv2.perspectiveTransform(ipm_mid_pts, IPM_INV_MATRIX).reshape(-1, 2)
+    overlay_centers = []
+    for x, y in raw_mid_pts:
+        ox = int(round(639.0 - x))  # 镜像恢复
+        oy = int(round(y))
+        if 0 <= ox < w and 0 <= oy < h:
+            overlay_centers.append((ox, oy))
+
+    return overlay_centers, [], angle_error_ipm, center_error_ipm, clean_mask
+
+
+def extract_line_centers_fallback(mask):
+    """退化模式降级备用"""
+    h, w = mask.shape
+    centers = []
     step = 4
     for y in range(h - 1, int(h * 0.45), -step):
-        white_indices = np.where(clean_mask[y] == 255)[0]
-        if len(white_indices) == 0:
-            continue
-
-        diff = np.diff(white_indices)
-        breaks = np.where(diff > 1)[0] + 1
-        clusters = np.split(white_indices, breaks)
-        means = [int(np.mean(cluster)) for cluster in clusters if len(cluster) >= 2]
-
-        if len(means) == 1:
-            edge_x = means[0]
-            # 单侧车道线情况：结合上一帧走向推算另一侧虚拟边缘
-            if len(centers) > 1:
-                last_x = centers[-1][0]
-                prev_x = centers[-2][0]
-                virtual_x = 0 if last_x < prev_x else w - 1
-            else:
-                virtual_x = w - 1 if edge_x < w // 2 else 0
-            
-            cand_x = int((edge_x + virtual_x) / 2)
-            edge_samples.append(((edge_x, y), (virtual_x, y)))
-
-        elif len(means) >= 2:
-            left_x = max((x for x in means if x < w / 2), default=None)
-            right_x = min((x for x in means if x >= w / 2), default=None)
-            if left_x is not None and right_x is not None:
-                cand_x = int((left_x + right_x) / 2)
-                edge_samples.append(((left_x, y), (right_x, y)))
-            else:
-                cand_x = int(np.mean(means[:2]))
-        else:
-            continue
-
-        # 防跳变约束：相邻中线点横向偏移不应超过 35 像素
-        if len(centers) == 0 or abs(cand_x - centers[-1][0]) < 35:
-            centers.append((cand_x, y))
-
-    # 历史记忆 Fallback
-    if len(centers) >= 3:
-        state.last_center_points = list(centers)
-    elif len(state.last_center_points) >= 3:
-        centers = list(state.last_center_points)
-
-    return centers, edge_samples, clean_mask
-
-
-def calculate_line_errors(centers, width):
-    """
-    计算中线角度误差与近处横向偏离像素 (参照去年 calculate_slope 算法)
-    """
-    if len(centers) < 3:
-        return 0.0, 0.0
-
-    p_near = centers[0]
-    p_far = centers[min(len(centers) - 1, int(len(centers) / 3.0))]
-    
-    # 近远处向向量夹角 (与正上方 -90 度的偏差)
-    angle_rad = math.atan2(p_far[1] - p_near[1], p_far[0] - p_near[0])
-    angle_deg = math.degrees(angle_rad)
-    
-    # 归一化航向误差 (正前方为 0°)
-    if angle_deg > 0:
-        angle_error = -90.0 + angle_deg
-    else:
-        angle_error = 90.0 + angle_deg
-
-    # 近处横向偏离像素 (图片中心 320)
-    near_points = centers[:min(5, len(centers))]
-    center_error = float(np.mean([p[0] for p in near_points]) - width / 2.0)
-
-    return angle_error, center_error
+        xs = np.flatnonzero(mask[y] > 0)
+        if len(xs) > 0:
+            centers.append((int(np.mean(xs)), y))
+    return centers, [], 0.0, 0.0, mask
 
 
 def image_cb(msg):
@@ -272,8 +309,7 @@ def image_cb(msg):
             hsv_p = dict(state.hsv_params)
 
         mask, roi = make_mask(frame, hsv_p)
-        centers, samples, clean_mask = extract_line_centers(mask)
-        angle_error, center_error = calculate_line_errors(centers, frame.shape[1])
+        centers, samples, angle_error, center_error, clean_mask = extract_line_centers_ipm(mask)
 
         overlay = frame.copy()
         cv2.rectangle(overlay, (roi[0], roi[1]), (roi[2] - 1, roi[3] - 1), (255, 120, 0), 2)
@@ -458,6 +494,7 @@ def shutdown():
 def main():
     global cmd_pub, mask_pub, overlay_pub
     rospy.init_node('line_following_node', anonymous=False)
+    init_ipm()
     load_hsv()
 
     cmd_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=1)
