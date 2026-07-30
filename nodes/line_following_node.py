@@ -297,7 +297,13 @@ def image_cb(msg):
             hsv_p = dict(state.hsv_params)
 
         mask, roi = make_mask(frame, hsv_p)
-        centers, samples, angle_error, center_error, clean_mask = extract_line_centers_ipm(mask)
+        # 降采样到 (320, 240) 匹配去年算法的最佳性能 (避免 480 满分辨率循环导致 CPU 拖慢爆出画面超时)
+        small_mask = cv2.resize(mask, (320, 240), interpolation=cv2.INTER_NEAREST)
+        centers_small, samples, angle_error, center_error, _ = extract_line_centers_ipm(small_mask)
+
+        # 还原到原始 640x480 画面坐标进行叠加显示
+        centers = [(x * 2, y * 2) for x, y in centers_small]
+        center_error = center_error * 2.0  # 还原真实像素误差
 
         overlay = frame.copy()
         cv2.rectangle(overlay, (roi[0], roi[1]), (roi[2] - 1, roi[3] - 1), (255, 120, 0), 2)
@@ -452,7 +458,7 @@ class Handler(BaseHTTPRequestHandler):
                 if state.mode == 'RUNNING':
                     self.reply({'ok': False, 'error': '巡线任务已经在运行中'})
                     return
-                if time.time() - state.last_image_time > 0.6:
+                if time.time() - state.last_image_time > 1.2:
                     self.reply({'ok': False, 'error': '摄像头画面超时，请检查相机'})
                     return
                 state.mode = 'RUNNING'
