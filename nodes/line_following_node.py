@@ -377,9 +377,11 @@ PAGE = '''<!doctype html><meta charset="utf-8"><title>高速巡线独立控制�
 <p><button class="start" onclick="post('/api/start')">解锁并开始巡线</button><button class="stop" onclick="post('/api/stop')">立即停车</button><button onclick="post('/api/reset')">复位为仅感知</button></p>
 <pre id="status">加载状态中...</pre></section>
 <section><h3>识别叠加图 (/line_following/debug/overlay) 与 二值图 (/line_following/debug/mask)</h3>
-<p><img src="http://'+location.hostname+':8080/stream?topic=/line_following/debug/overlay"><img src="http://'+location.hostname+':8080/stream?topic=/line_following/debug/mask"></p></section>
+<p><img id="img_overlay"><img id="img_mask"></p></section>
 </main>
 <script>
+document.getElementById('img_overlay').src = 'http://' + window.location.hostname + ':8080/stream?topic=/line_following/debug/overlay';
+document.getElementById('img_mask').src = 'http://' + window.location.hostname + ':8080/stream?topic=/line_following/debug/mask';
 async function post(url){
     try {
         let r = await fetch(url,{method:'POST'});
