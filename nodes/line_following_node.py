@@ -186,86 +186,130 @@ def init_ipm():
             rospy.logwarn("巡线节点读取 IPM 配置文件失败: %s", err)
 
 
-def extract_line_centers_last_year(mask):
+def extract_line_centers_ipm(mask):
     """
-    100% 继承去年 xunxian.py 比赛证明的全高逐行扫描与单边虚拟边界算法：
-    从图像最底部向上扫描全高度，提取中线点集，即使单边丢失也能覆盖全图高度，算处巨大的转弯角速度。
+    在鸟瞰图 (IPM) 地面物理坐标系下提取双边/单边中线：
+    单边丢失时，在 IPM 空间平移 200px (物理半车道宽度)，并通过 IPM_INV_MATRIX
+    反向投影回相机原始视角，绘制符合透视画面的流畅绿色中线。
     """
+    if IPM_MATRIX is None or IPM_INV_MATRIX is None:
+        return extract_line_centers_fallback(mask)
+
     h, w = mask.shape
-    center_points = []
-    edge_samples = []
-    
-    # 清理掩膜主要轮廓
     result = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     contours = result[0] if len(result) == 2 else result[1]
     contours = [c for c in contours if cv2.contourArea(c) > 120]
+    
+    if not contours:
+        return [], [], 0.0, 0.0, np.zeros_like(mask)
+
+    contours.sort(key=lambda c: cv2.contourArea(c), reverse=True)
+    
     clean_mask = np.zeros_like(mask)
-    if contours:
-        cv2.drawContours(clean_mask, contours[:4], -1, 255, -1)
+    cv2.drawContours(clean_mask, contours[:4], -1, 255, -1)
 
-    step = 4
-    for y in range(h - 1, -1, -step):
-        white_indices = np.where(clean_mask[y] == 255)[0]
-        if len(white_indices) == 0:
-            continue
+    # 将轮廓转换为鸟瞰图 (IPM) 点集
+    fits = []
+    for c in contours[:4]:
+        pts = c.reshape(-1, 1, 2).astype(np.float32).copy()
+        pts[:, 0, 0] = 639.0 - pts[:, 0, 0]  # 还原镜像
+        ipm_pts = cv2.perspectiveTransform(pts, IPM_MATRIX).reshape(-1, 2)
+        ipm_pts = ipm_pts[np.isfinite(ipm_pts).all(axis=1)]
+        ipm_pts = ipm_pts[(ipm_pts[:, 0] > -200) & (ipm_pts[:, 0] < 800) &
+                          (ipm_pts[:, 1] > 0) & (ipm_pts[:, 1] < 600)]
+        if len(ipm_pts) >= 10 and np.ptp(ipm_pts[:, 1]) > 40:
+            k, b = np.polyfit(ipm_pts[:, 1], ipm_pts[:, 0], 1)
+            # 过滤横向停止线、白板边缘 (斜率不能太横向)
+            if abs(k) < 1.5:
+                fits.append({
+                    'k': float(k), 'b': float(b),
+                    'y_min': float(np.min(ipm_pts[:, 1])),
+                    'y_max': float(np.max(ipm_pts[:, 1])),
+                    'span': float(np.ptp(ipm_pts[:, 1])),
+                    'contour': c
+                })
 
-        diff = np.diff(white_indices)
-        breaks = np.where(diff > 1)[0] + 1
-        clusters = np.split(white_indices, breaks)
-        means = [int(np.mean(cluster)) for cluster in clusters if len(cluster) >= 2]
-
-        if len(means) == 1:
-            edge_x = means[0]
-            # 单侧车道线情况：根据历史中线走向推算另一侧虚拟边缘
-            if len(center_points) > 1:
-                last_x = center_points[-1][0]
-                prev_x = center_points[-2][0]
-                virtual_x = 0 if last_x < prev_x else w - 1
-            else:
-                virtual_x = w - 1 if edge_x < w // 2 else 0
-            
-            cand_x = int((edge_x + virtual_x) / 2)
-            edge_samples.append(((edge_x, y), (virtual_x, y)))
-
-        elif len(means) >= 2:
-            left_x = max((x for x in means if x < w / 2), default=None)
-            right_x = min((x for x in means if x >= w / 2), default=None)
-            if left_x is not None and right_x is not None:
-                cand_x = int((left_x + right_x) / 2)
-                edge_samples.append(((left_x, y), (right_x, y)))
-            else:
-                cand_x = int(np.mean(means[:2]))
-        else:
-            continue
-
-        # 防跳变约束：相邻中线点横向偏移不应超过图像宽度的 1/6
-        if len(center_points) == 0 or abs(cand_x - center_points[-1][0]) < w / 6.0:
-            center_points.append((cand_x, y))
-
-    # 历史记忆 Fallback
-    if len(center_points) >= 3:
-        state.last_center_points = list(center_points)
-    elif len(state.last_center_points) >= 3:
-        center_points = list(state.last_center_points)
-
-    if not center_points:
+    if not fits:
         return [], [], 0.0, 0.0, clean_mask
 
-    # 去年 calculate_slope 算法：首尾与中段向量夹角计算
-    first_point = center_points[0]
-    middle_idx = min(len(center_points) - 1, int(round(len(center_points) / 3.5)))
-    middle_point = center_points[middle_idx]
+    # 修复单边分类致命 Bug：动态追踪上一帧中线，防止左右误判导致 200px 巨额跳变 (猛往左打的元凶！)
+    expected_mid_x = getattr(state, 'last_ipm_mid_x', 300.0)
     
-    angle_first_middle = math.degrees(math.atan2(middle_point[1] - first_point[1], middle_point[0] - first_point[0]))
-    if angle_first_middle > 0:
-        angle_error = -90.0 + angle_first_middle
+    # 通过底部的 X 坐标对比上一帧中线，判断线在左还是右
+    left_fits = [f for f in fits if f['k'] * 550.0 + f['b'] < expected_mid_x]
+    right_fits = [f for f in fits if f['k'] * 550.0 + f['b'] >= expected_mid_x]
+
+    IPM_HALF_LANE_WIDTH = 200.0  # IPM 地面坐标系物理半车道宽 (200px)
+
+    lf = max(left_fits, key=lambda f: f['span']) if left_fits else None
+    rf = max(right_fits, key=lambda f: f['span']) if right_fits else None
+
+    # 左右平行度与物理间距校验 (防止左右打架)
+    if lf and rf:
+        k_diff = abs(lf['k'] - rf['k'])
+        bottom_w = (rf['k'] * 550.0 + rf['b']) - (lf['k'] * 550.0 + lf['b'])
+        if k_diff > 0.35 or bottom_w < 250.0 or bottom_w > 550.0:
+            # 依赖更清晰的线，若差不多则优先保右边界
+            if abs(rf['k']) < abs(lf['k']) + 0.15:
+                lf = None
+            else:
+                rf = None
+
+    if lf and rf:
+        k_mid = (lf['k'] + rf['k']) / 2.0
+        b_mid = (lf['b'] + rf['b']) / 2.0
+    elif lf:
+        k_mid = lf['k']
+        b_mid = lf['b'] + IPM_HALF_LANE_WIDTH  # 左线单边，向右平移 200px
+    elif rf:
+        k_mid = rf['k']
+        b_mid = rf['b'] - IPM_HALF_LANE_WIDTH  # 右线单边，向左平移 200px
     else:
-        angle_error = 90.0 + angle_first_middle
+        return [], [], 0.0, 0.0, clean_mask
 
-    near_points = center_points[:min(5, len(center_points))]
-    center_error = float(np.mean([p[0] for p in near_points]) - w / 2.0)
+    # 记忆底部中线 X 坐标，供下一帧动态分类使用
+    state.last_ipm_mid_x = k_mid * 550.0 + b_mid
 
-    return center_points, edge_samples, angle_error, center_error, clean_mask
+    # 修复单边不转弯 Bug：强制把单边线在整个纵深范围内推导延伸，覆盖远端视距
+    y_min_mid = 100.0
+    y_max_mid = 590.0
+
+    # 在鸟瞰图中生成近端与远端中线点集
+    y_steps = np.linspace(y_min_mid, y_max_mid, num=30)
+    ipm_mid_pts = np.float32([
+        [k_mid * y + b_mid, y] for y in y_steps
+    ]).reshape(-1, 1, 2)
+
+    # 近端误差 (小车正前方地面 Y_ipm in [400, 590])
+    near_ipm_xs = [p[0, 0] for p in ipm_mid_pts if p[0, 1] >= 400.0]
+    if not near_ipm_xs:
+        near_ipm_xs = [p[0, 0] for p in ipm_mid_pts]
+    center_error_near = float(np.mean(near_ipm_xs) - 300.0)
+    angle_error_near = float(math.degrees(math.atan2(-k_mid, 1.0)))
+
+    # 远端弯道预判误差 (前方 0.5~1 米处 Y_ipm in [100, 380])
+    far_ipm_pts = [p[0] for p in ipm_mid_pts if p[0, 1] <= 380.0]
+    if len(far_ipm_pts) >= 4:
+        far_xs = [p[0] for p in far_ipm_pts]
+        far_ys = [p[1] for p in far_ipm_pts]
+        k_far, _ = np.polyfit(far_ys, far_xs, 1)
+        angle_error_far = float(math.degrees(math.atan2(-k_far, 1.0)))
+    else:
+        angle_error_far = angle_error_near
+
+    # 远近结合的“弯道前馈预判角度” (远端占 65% 权重，实现提前打方向)
+    presteer_angle_error = 0.65 * angle_error_far + 0.35 * angle_error_near
+
+    # 利用逆矩阵 IPM_INV_MATRIX 将鸟瞰图中线反向投影回相机原始视角
+    raw_mid_pts = cv2.perspectiveTransform(ipm_mid_pts, IPM_INV_MATRIX).reshape(-1, 2)
+    overlay_centers = []
+    for x, y in raw_mid_pts:
+        ox = int(round(639.0 - x))  # 镜像恢复
+        oy = int(round(y))
+        if 0 <= ox < w and 0 <= oy < h:
+            overlay_centers.append((ox, oy))
+
+    return overlay_centers, [], presteer_angle_error, center_error_near, clean_mask
 
 
 def extract_line_centers_fallback(mask):
@@ -295,7 +339,7 @@ def image_cb(msg):
             hsv_p = dict(state.hsv_params)
 
         mask, roi = make_mask(frame, hsv_p)
-        centers, samples, angle_error, center_error, clean_mask = extract_line_centers_last_year(mask)
+        centers, samples, angle_error, center_error, clean_mask = extract_line_centers_ipm(mask)
 
         overlay = frame.copy()
         cv2.rectangle(overlay, (roi[0], roi[1]), (roi[2] - 1, roi[3] - 1), (255, 120, 0), 2)
@@ -471,7 +515,6 @@ class Handler(BaseHTTPRequestHandler):
 
 
 import socket
-
 
 class ReusableHTTPServer(HTTPServer):
     allow_reuse_address = True
