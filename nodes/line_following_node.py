@@ -299,7 +299,7 @@ def image_cb(msg):
         mask, roi = make_mask(frame, hsv_p)
         # 降采样到 (320, 240) 匹配去年算法的最佳性能 (避免 480 满分辨率循环导致 CPU 拖慢爆出画面超时)
         small_mask = cv2.resize(mask, (320, 240), interpolation=cv2.INTER_NEAREST)
-        centers_small, samples, angle_error, center_error, _ = extract_line_centers_ipm(small_mask)
+        centers_small, samples, angle_error, center_error, clean_mask = extract_line_centers_ipm(small_mask)
 
         # 还原到原始 640x480 画面坐标进行叠加显示
         centers = [(x * 2, y * 2) for x, y in centers_small]
