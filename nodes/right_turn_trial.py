@@ -125,7 +125,7 @@ def safe_cv2_to_imgmsg(cv_img, encoding="bgr8"):
 
 
 def init_ipm():
-    global IPM_MATRIX
+    global IPM_MATRIX, IPM_INV_MATRIX
     if os.path.exists(PERSP_PATH):
         try:
             with open(PERSP_PATH, 'r') as f:
@@ -133,7 +133,8 @@ def init_ipm():
                 src_pts = np.float32(data['src_points'])
                 dst_pts = np.float32(data['dst_points'])
                 IPM_MATRIX = cv2.getPerspectiveTransform(src_pts, dst_pts)
-                rospy.loginfo("成功载入鸟瞰图 (IPM) 矩阵配置文件: %s", PERSP_PATH)
+                IPM_INV_MATRIX = cv2.getPerspectiveTransform(dst_pts, src_pts)
+                rospy.loginfo("成功载入鸟瞰图 (IPM) 正向及反向矩阵: %s", PERSP_PATH)
         except Exception as err:
             rospy.logwarn("读取 IPM 配置文件失败: %s", err)
 
@@ -175,60 +176,73 @@ def get_contour_slope_ipm(contour):
 
 def get_virtual_extended_midline(right_edge, mask_shape):
     """
-    当锁定右出口车道线 (right_edge) 时，将其向小车方向（画面底部 y=h-1）向下外推延伸，
-    并推算出虚拟的左边界与全高度绿色中线点集及虚线绘制段。
+    在鸟瞰图 (IPM) 地面物理坐标系下拟合右边界并向下外推延伸至小车脚下 (Y_ipm=600)，
+    扣除固定物理车道宽度 (200px中线偏移) 后，利用逆矩阵 IPM_INV_MATRIX
+    反向投影回相机 2D 图像视角绘制符合近大远小透视效果的绿色虚线中线。
     """
-    if right_edge is None or len(right_edge) < 5:
+    if right_edge is None or len(right_edge) < 5 or IPM_MATRIX is None or IPM_INV_MATRIX is None:
         return None, [], []
     
     h, w = mask_shape
-    pts = right_edge.reshape(-1, 2)
-    ys = pts[:, 1]
-    xs = pts[:, 0]
-    
-    if np.max(ys) - np.min(ys) < 12:
-        return None, [], []
-    
     try:
-        kr, br = np.polyfit(ys, xs, 1)
-    except Exception:
-        return None, [], []
-
-    # 标准车道像素宽度 (底部约 360px)
-    LANE_WIDTH_PX = 360.0
-    
-    y_min = int(np.min(ys))
-    y_max = h - 1  # 延伸至画面最底部 (小车车头前方)
-    
-    virtual_centers = []
-    dashed_segments = []
-    
-    y_step = 8
-    y_range = list(range(y_max, max(0, y_min - 20), -y_step))
-    
-    for idx, y in enumerate(y_range):
-        rx_ext = kr * y + br
-        lx_ext = rx_ext - LANE_WIDTH_PX
-        cx_ext = (rx_ext + lx_ext) / 2.0
+        # 1. 还原翻转前相机原始坐标，转换为鸟瞰图 (IPM) 坐标 (dst_points: width=600, height=600)
+        pts_raw = right_edge.reshape(-1, 1, 2).astype(np.float32).copy()
+        pts_raw[:, 0, 0] = 639.0 - pts_raw[:, 0, 0]
+        pts_ipm = cv2.perspectiveTransform(pts_raw, IPM_MATRIX).reshape(-1, 2)
         
-        cx_int = int(round(cx_ext))
-        cy_int = int(y)
-        virtual_centers.append((cx_int, cy_int))
+        ys_ipm = pts_ipm[:, 1]
+        xs_ipm = pts_ipm[:, 0]
         
-        # 每隔 1 个 y_step 绘制线段，留出 1 个 y_step 的空隙，形成标准绿虚线
-        if idx % 2 == 0:
-            next_y = max(0, y - y_step)
-            next_cx = int(round(kr * next_y + br - LANE_WIDTH_PX / 2.0))
-            dashed_segments.append(((cx_int, cy_int), (next_cx, int(next_y))))
+        if np.max(ys_ipm) - np.min(ys_ipm) < 15:
+            return None, [], []
+        
+        # 2. 在鸟瞰图物理坐标系中拟合直线 X_ipm = k_ipm * Y_ipm + b_ipm
+        k_ipm, b_ipm = np.polyfit(ys_ipm, xs_ipm, 1)
+        
+        # 鸟瞰图中，车道左右宽度固定为 400px (对应 dst_pts 中 100 到 500)，中线偏移为 -200px
+        IPM_MIDLINE_OFFSET_PX = 200.0
+        
+        y_min_ipm = float(np.min(ys_ipm))
+        y_max_ipm = 595.0  # 鸟瞰图最底部 (小车正前方地面)
+        
+        y_steps = np.linspace(y_min_ipm, y_max_ipm, num=30)
+        
+        ipm_mid_pts = []
+        for y in y_steps:
+            x_right_ipm = k_ipm * y + b_ipm
+            x_mid_ipm = x_right_ipm - IPM_MIDLINE_OFFSET_PX
+            ipm_mid_pts.append([x_mid_ipm, y])
+            
+        ipm_mid_pts = np.array(ipm_mid_pts, dtype=np.float32).reshape(-1, 1, 2)
+        
+        # 3. 计算鸟瞰图近处 (Y_ipm 靠近 600) 的像素偏差 (IPM 鸟瞰图中心为 X=300)
+        near_ipm_xs = [p[0, 0] for p in ipm_mid_pts if p[0, 1] >= 450.0]
+        if len(near_ipm_xs) == 0:
+            near_ipm_xs = [p[0, 0] for p in ipm_mid_pts]
+        ipm_near_error = float(np.mean(near_ipm_xs) - 300.0)
+        
+        # 4. 利用逆矩阵 IPM_INV_MATRIX 将鸟瞰图中线反向投影回相机原始视角
+        pts_raw_back = cv2.perspectiveTransform(ipm_mid_pts, IPM_INV_MATRIX).reshape(-1, 2)
+        
+        # 重新镜像 X 坐标以匹配 flipped_frame
+        overlay_pts = []
+        for p in pts_raw_back:
+            ox = int(round(639.0 - p[0]))
+            oy = int(round(p[1]))
+            # 过滤掉离开图像视角或非常荒谬的点
+            if -100 <= ox <= w + 100 and -100 <= oy <= h + 100:
+                overlay_pts.append((ox, oy))
+                
+        # 5. 生成虚线绘制段 (Dashed Line Segments)
+        dashed_segments = []
+        for i in range(0, len(overlay_pts) - 1, 2):
+            dashed_segments.append((overlay_pts[i], overlay_pts[i + 1]))
+            
+        return ipm_near_error, overlay_pts, dashed_segments
 
-    if len(virtual_centers) < 3:
+    except Exception as err:
+        rospy.logwarn_throttle(2, f"IPM 虚拟延伸计算异常: {err}")
         return None, [], []
-    
-    # 取最靠近小车（画面最底部）的 6 个点的平均偏离像素
-    near_points = virtual_centers[:min(6, len(virtual_centers))]
-    near_error = float(np.mean([p[0] for p in near_points]) - w / 2.0)
-    
-    return near_error, virtual_centers, dashed_segments
 
 
 def make_mask(frame, params):
