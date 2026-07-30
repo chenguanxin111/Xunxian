@@ -188,124 +188,86 @@ def init_ipm():
 
 def extract_line_centers_ipm(mask):
     """
-    在鸟瞰图 (IPM) 地面物理坐标系下提取双边/单边中线：
-    单边丢失时，在 IPM 空间平移 200px (物理半车道宽度)，并通过 IPM_INV_MATRIX
-    反向投影回相机原始视角，绘制符合透视画面的流畅绿色中线。
+    去年实车跑圈完全验证过的图像空间扫描算法：
+    不做任何死板的鸟瞰图直线/抛物线拟合，直接在图像视距空间逐行扫描提取边线。
+    利用前瞻割线角 (angle_first_middle) 在弯道前提前强力打方向！
     """
-    if IPM_MATRIX is None or IPM_INV_MATRIX is None:
-        return extract_line_centers_fallback(mask)
+    height, width = mask.shape
+    step = 4
+    center_points = []
+    edge_points = []
 
-    h, w = mask.shape
-    result = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    contours = result[0] if len(result) == 2 else result[1]
-    contours = [c for c in contours if cv2.contourArea(c) > 120]
-    
-    if not contours:
-        return [], [], 0.0, 0.0, np.zeros_like(mask)
+    for y in range(height - 1, -1, -step):
+        white_indices = np.where(mask[y] == 255)[0]
+        if len(white_indices) == 0:
+            continue
 
-    contours.sort(key=lambda c: cv2.contourArea(c), reverse=True)
-    
-    clean_mask = np.zeros_like(mask)
-    cv2.drawContours(clean_mask, contours[:4], -1, 255, -1)
+        diff = np.diff(white_indices)
+        breaks = np.where(diff > 1)[0] + 1
+        clusters = np.split(white_indices, breaks)
+        mean_indices = [np.mean(cluster) for cluster in clusters]
 
-    # 将轮廓转换为鸟瞰图 (IPM) 点集
-    fits = []
-    for c in contours[:4]:
-        pts = c.reshape(-1, 1, 2).astype(np.float32).copy()
-        pts[:, 0, 0] = 639.0 - pts[:, 0, 0]  # 还原镜像
-        ipm_pts = cv2.perspectiveTransform(pts, IPM_MATRIX).reshape(-1, 2)
-        ipm_pts = ipm_pts[np.isfinite(ipm_pts).all(axis=1)]
-        # 限制在地面有效区域内
-        ipm_pts = ipm_pts[(ipm_pts[:, 0] > -100) & (ipm_pts[:, 0] < 700) &
-                          (ipm_pts[:, 1] > 50) & (ipm_pts[:, 1] < 600)]
-                          
-        if len(ipm_pts) >= 15 and np.ptp(ipm_pts[:, 1]) > 50:
-            ys = ipm_pts[:, 1]
-            xs = ipm_pts[:, 0]
-            # 拟合 2 次多项式 x = a*y^2 + b*y + c
-            poly = np.polyfit(ys, xs, 2)
-            # 计算底端 (y=550) 预测 X，用于过滤横向线和区分左右
-            bottom_x = poly[0] * (550.0**2) + poly[1] * 550.0 + poly[2]
-            # 检查导数/斜率，过滤横向停止线
-            slope_bottom = 2 * poly[0] * 550.0 + poly[1]
-            if abs(slope_bottom) < 1.8:
-                fits.append({
-                    'poly': poly,
-                    'bottom_x': float(bottom_x),
-                    'span': float(np.ptp(ys)),
-                    'y_min': float(np.min(ys)),
-                    'y_max': float(np.max(ys))
-                })
+        current_edge_points = []
+        if len(mean_indices) == 1:
+            edge_x = int(mean_indices[0])
+            current_edge_points.append(edge_x)
 
-    if not fits:
-        return [], [], 0.0, 0.0, clean_mask
-
-    # 依据上一帧记录的中线，进行左右车道线分类 (记忆防跳变)
-    expected_mid_x = getattr(state, 'last_ipm_mid_x', 300.0)
-    
-    left_fits = [f for f in fits if f['bottom_x'] < expected_mid_x]
-    right_fits = [f for f in fits if f['bottom_x'] >= expected_mid_x]
-
-    lf = max(left_fits, key=lambda f: f['span']) if left_fits else None
-    rf = max(right_fits, key=lambda f: f['span']) if right_fits else None
-
-    # 左右双线冲突校验
-    if lf and rf:
-        w_bottom = rf['bottom_x'] - lf['bottom_x']
-        if w_bottom < 200.0 or w_bottom > 550.0:
-            # 宽带异常，优先保更长的线
-            if lf['span'] >= rf['span']:
-                rf = None
+            if len(center_points) > 1:
+                last_center_x = center_points[-1][0]
+                second_last_center_x = center_points[-2][0]
+                virtual_edge_x = 0 if last_center_x < second_last_center_x else width - 1
             else:
-                lf = None
+                virtual_edge_x = width - 1 if edge_x < width // 2 else 0
 
-    # 构建最终中线多项式 P_mid(y) = a*y^2 + b*y + c
-    IPM_HALF_LANE_WIDTH = 200.0
+            current_edge_points.append(virtual_edge_x)
+            avg_index = np.mean(current_edge_points)
+            new_center_point = (int(avg_index), y)
+            
+        elif len(mean_indices) > 1:
+            for idx in mean_indices:
+                current_edge_points.append(int(idx))
+
+            if len(current_edge_points) == 2:
+                if abs(current_edge_points[0] - current_edge_points[1]) < width / 3:
+                    if abs(current_edge_points[0] - width // 2) > abs(current_edge_points[1] - width // 2):
+                        current_edge_points = [current_edge_points[1], width - 1 if current_edge_points[1] < width // 2 else 0]
+                    else:
+                        current_edge_points = [current_edge_points[0], width - 1 if current_edge_points[0] < width // 2 else 0]
+                avg_index = np.mean(current_edge_points)
+                new_center_point = (int(avg_index), y)
+            else:
+                mid_x = width // 2
+                left_edge_points = [pt for pt in current_edge_points if pt < mid_x]
+                right_edge_points = [pt for pt in current_edge_points if pt >= mid_x]
+                left_nearest = min(left_edge_points, key=lambda x: abs(x - mid_x)) if left_edge_points else 0
+                right_nearest = min(right_edge_points, key=lambda x: abs(x - mid_x)) if right_edge_points else width - 1
+                current_edge_points = [left_nearest, right_nearest]
+                avg_index = np.mean(current_edge_points)
+                new_center_point = (int(avg_index), y)
+
+        for rp in current_edge_points:
+            edge_points.append((rp, y))
+
+        if len(center_points) == 0 or abs(new_center_point[0] - center_points[-1][0]) < width / 8:
+            center_points.append(new_center_point)
+
+    if not center_points or len(center_points) < 3:
+        return [], [], 0.0, 0.0, mask
+
+    # 去年核心 calculate_slope 割线角度算法：
+    first_point = center_points[0]
+    middle_idx = min(len(center_points) - 1, int(round(len(center_points) / 3.5)))
+    middle_point = center_points[middle_idx]
     
-    if lf and rf:
-        # 双侧都有：中线多项式为左右系数直接取平均
-        poly_mid = (lf['poly'] + rf['poly']) / 2.0
-    elif lf:
-        # 仅左侧：多项式向右平移 200px (常数项 c + 200)
-        poly_mid = lf['poly'].copy()
-        poly_mid[2] += IPM_HALF_LANE_WIDTH
-    elif rf:
-        # 仅右侧：多项式向左平移 200px (常数项 c - 200)
-        poly_mid = rf['poly'].copy()
-        poly_mid[2] -= IPM_HALF_LANE_WIDTH
-    else:
-        return [], [], 0.0, 0.0, clean_mask
-
-    # 生成采样点 (从车头 y=550 延伸到远处 y=150)
-    y_steps = np.linspace(150.0, 550.0, num=30)
-    x_steps = poly_mid[0] * (y_steps**2) + poly_mid[1] * y_steps + poly_mid[2]
+    angle_first_middle = np.degrees(np.arctan2(middle_point[1] - first_point[1], middle_point[0] - first_point[0]))
     
-    # 记忆底端中线 X，供下一帧防跳变分类使用
-    bottom_mid_x = poly_mid[0] * (550.0**2) + poly_mid[1] * 550.0 + poly_mid[2]
-    state.last_ipm_mid_x = float(bottom_mid_x)
-
-    # 1. 计算近端位置偏差 (y=550 处)
-    center_error_near = float(bottom_mid_x - 300.0)
-
-    # 2. 计算弯道割线前瞻角度 (从 y=550 指向 y=250 的矢量)
-    x_near = bottom_mid_x
-    x_far = poly_mid[0] * (250.0**2) + poly_mid[1] * 250.0 + poly_mid[2]
-    dx = x_far - x_near
-    dy = 550.0 - 250.0  # 前向距离 = 300.0
-    angle_error_deg = float(math.degrees(math.atan2(dx, dy)))
-
-    # 反向投影回相机原始视角叠加绘制
-    ipm_mid_pts = np.column_stack((x_steps, y_steps)).reshape(-1, 1, 2).astype(np.float32)
-    raw_mid_pts = cv2.perspectiveTransform(ipm_mid_pts, IPM_INV_MATRIX).reshape(-1, 2)
+    # 图像空间角度误差公式：直上为 -90°，右歪 -90，左歪 90
+    angle_error = -90.0 + angle_first_middle if angle_first_middle > 0 else 90.0 + angle_first_middle
     
-    overlay_centers = []
-    for x, y in raw_mid_pts:
-        ox = int(round(639.0 - x))  # 镜像恢复
-        oy = int(round(y))
-        if 0 <= ox < w and 0 <= oy < h:
-            overlay_centers.append((ox, oy))
+    # 近端横向位置偏差
+    center_error = float(first_point[0] - width // 2)
 
-    return overlay_centers, [], angle_error_deg, center_error_near, clean_mask
+    return center_points, [], float(angle_error), float(center_error), mask
 
 
 def extract_line_centers_fallback(mask):
