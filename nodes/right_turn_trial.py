@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Low-speed right-turn trial node with IPM bird's-eye view slope matching.
+"""Low-speed right-turn entry trial with IPM lane alignment.
 
 The node starts DISARMED and publishes no velocity until /api/start is called.
-It advances 0.25 m using odometry, rotates right up to 60 degrees, and stops
-when a stable right-edge candidate is visible.
+It reaches the junction, searches the right exit, enters it on a slow arc,
+aligns between two current-frame lane boundaries, and then stops.
 """
 import json
 import math
@@ -42,6 +42,41 @@ ROTATE_TIMEOUT = 15.0
 CENTER_TOLERANCE_PX = 120
 EDGE_CONFIRM_FRAMES = 4
 
+# 右出口驶入阶段：保守里程计弧线后，由当前帧视觉中线接管。
+ENTRY_ARC_SPEED = 0.06
+ENTRY_ARC_BLIND_SPEED = 0.06
+# 视觉引导尚未建立时只允许保守右转，避免固定追 88 度导致过头。
+ENTRY_ARC_BLIND_TARGET_DEG = 68.0
+ENTRY_ARC_BLIND_STOP_DEG = 72.0
+ENTRY_ARC_MAX_DISTANCE = 0.45
+ENTRY_ARC_TIMEOUT = 15.0
+ENTRY_ARC_MAX_TURN_DEG = 95.0
+DUAL_EDGE_CONFIRM_FRAMES = 8
+DUAL_ACCEPT_MIN_TURN_DEG = 65.0
+
+# 双边线对准阶段：只用当前帧真实左右边界，不使用历史中心线判成功。
+ALIGN_SPEED = 0.06
+ALIGN_MAX_DISTANCE = 0.35
+ALIGN_TIMEOUT = 10.0
+ALIGN_MIN_DISTANCE = 0.12
+ALIGN_HEADING_TOL_DEG = 8.0
+ALIGN_CENTER_TOL_PX = 45.0
+ALIGN_CONFIRM_FRAMES = 10
+ENTRY_GUIDE_MIN_DISTANCE = 0.15
+ENTRY_GUIDE_CONFIRM_FRAMES = 8
+ROW_GUIDE_MIN_POINTS = 10
+ROW_GUIDE_CENTER_TOL_PX = 50.0
+ROW_GUIDE_HEADING_TARGET_DEG = 0.0
+ROW_GUIDE_HEADING_TOL_DEG = 15.0
+ROW_GUIDE_CONFIRM_FRAMES = 6
+ROW_GUIDE_ACCEPT_MIN_TURN_DEG = 50.0
+
+# IPM 的目标图宽为 600，标定目标车道宽约 400 px；先使用宽容范围。
+IPM_CENTER_X = 300.0
+IPM_LANE_WIDTH_MIN = 220.0
+IPM_LANE_WIDTH_MAX = 520.0
+IPM_LANE_HALF_WIDTH = 200.0  # 400 px ~= 实测 42 cm，半宽约 21 cm
+
 DEFAULT_PARAMS = {
     'low_h': 0, 'high_h': 179,
     'low_s': 0, 'high_s': 45,
@@ -52,6 +87,7 @@ DEFAULT_PARAMS = {
 }
 
 IPM_MATRIX = None
+IPM_INV_MATRIX = None
 
 
 def normalize_angle(value):
@@ -81,6 +117,27 @@ class SharedState:
         self.slope_diff = None
         self.virtual_center_error = None
         self.entry_start_dist = 0.0
+        self.phase_start_pose = None
+        self.phase_distance = 0.0
+        self.dual_lane_frames = 0
+        self.align_good_frames = 0
+        self.dual_lane_valid = False
+        self.lane_center_error = None
+        self.lane_heading_error_deg = None
+        self.lane_width_ipm = None
+        self.entry_guide_valid = False
+        self.entry_guide_confirmed = False
+        self.entry_guide_center_error = None
+        self.entry_guide_heading_error_deg = None
+        self.entry_guide_good_frames = 0
+        self.row_guide_valid = False
+        self.row_guide_center_error = None
+        self.row_guide_heading_error_deg = None
+        self.row_guide_points = 0
+        self.row_guide_good_frames = 0
+        self.control_source = 'STOPPED'
+        self.command_linear_x = 0.0
+        self.command_angular_z = 0.0
 
     def status(self):
         return {
@@ -96,6 +153,26 @@ class SharedState:
             'ipm_left_slope': round(self.left_slope, 3) if self.left_slope is not None else None,
             'ipm_right_slope': round(self.right_slope, 3) if self.right_slope is not None else None,
             'ipm_slope_diff': round(self.slope_diff, 3) if self.slope_diff is not None else None,
+            'phase_distance_m': round(self.phase_distance, 3),
+            'dual_lane_confirm': self.dual_lane_frames,
+            'dual_lane_valid': self.dual_lane_valid,
+            'lane_center_error_ipm': round(self.lane_center_error, 1) if self.lane_center_error is not None else None,
+            'lane_heading_error_deg': round(self.lane_heading_error_deg, 1) if self.lane_heading_error_deg is not None else None,
+            'lane_width_ipm': round(self.lane_width_ipm, 1) if self.lane_width_ipm is not None else None,
+            'align_good_frames': self.align_good_frames,
+            'entry_guide_valid': self.entry_guide_valid,
+            'entry_guide_confirmed': self.entry_guide_confirmed,
+            'entry_guide_center_error_ipm': round(self.entry_guide_center_error, 1) if self.entry_guide_center_error is not None else None,
+            'entry_guide_heading_error_deg': round(self.entry_guide_heading_error_deg, 1) if self.entry_guide_heading_error_deg is not None else None,
+            'entry_guide_good_frames': self.entry_guide_good_frames,
+            'row_guide_valid': self.row_guide_valid,
+            'row_guide_center_error_px': round(self.row_guide_center_error, 1) if self.row_guide_center_error is not None else None,
+            'row_guide_heading_error_deg': round(self.row_guide_heading_error_deg, 1) if self.row_guide_heading_error_deg is not None else None,
+            'row_guide_points': self.row_guide_points,
+            'row_guide_good_frames': self.row_guide_good_frames,
+            'control_source': self.control_source,
+            'command_linear_x': round(self.command_linear_x, 3),
+            'command_angular_z': round(self.command_angular_z, 3),
             'image_age_s': round(max(0.0, time.time() - self.last_image_time), 2),
         }
 
@@ -245,6 +322,184 @@ def get_virtual_extended_midline(right_edge, mask_shape):
         return None, [], []
 
 
+def contour_ipm_fit(contour, min_y_span=55.0):
+    """Fit x = k*y+b for one current-frame marking in the IPM plane."""
+    if contour is None or len(contour) < 5 or IPM_MATRIX is None:
+        return None
+    pts = contour.reshape(-1, 1, 2).astype(np.float32).copy()
+    pts[:, 0, 0] = 639.0 - pts[:, 0, 0]
+    ipm = cv2.perspectiveTransform(pts, IPM_MATRIX).reshape(-1, 2)
+    ipm = ipm[np.isfinite(ipm).all(axis=1)]
+    if len(ipm) < 5:
+        return None
+    # Keep a generous calibrated ground region while rejecting projection blow-up.
+    ipm = ipm[(ipm[:, 0] > -250) & (ipm[:, 0] < 850) &
+              (ipm[:, 1] > -100) & (ipm[:, 1] < 700)]
+    if len(ipm) < 5 or np.ptp(ipm[:, 1]) < min_y_span:
+        return None
+    k, b = np.polyfit(ipm[:, 1], ipm[:, 0], 1)
+    return {
+        'k': float(k), 'b': float(b),
+        'y_min': float(np.min(ipm[:, 1])),
+        'y_max': float(np.max(ipm[:, 1])),
+        'contour': contour,
+    }
+
+
+def build_entry_guide_ipm(contours, mask_shape):
+    """Build a full center guide from the long physical-left exit marking.
+
+    The image is mirrored for display, but contour_ipm_fit restores original
+    camera coordinates before IPM. Therefore the physical-left marking is the
+    fit whose projected x is smaller. A short physical-right marking confirms
+    its identity and lane width; the long left fit supplies the stable heading.
+    """
+    if IPM_MATRIX is None or IPM_INV_MATRIX is None:
+        return None
+
+    fits = [fit for fit in
+            (contour_ipm_fit(c, min_y_span=18.0) for c in contours[:8]) if fit]
+    for fit in fits:
+        fit['span'] = fit['y_max'] - fit['y_min']
+
+    best = None
+    for left_fit in fits:
+        if left_fit['span'] < 90.0:
+            continue
+        # Evaluate near the visible end, without extrapolating for identity.
+        left_ref_y = min(left_fit['y_max'], 560.0)
+        left_ref_x = left_fit['k'] * left_ref_y + left_fit['b']
+        if left_ref_x > IPM_CENTER_X + 80.0:
+            continue
+
+        for right_fit in fits:
+            if right_fit is left_fit or right_fit['span'] < 18.0:
+                continue
+            overlap_min = max(left_fit['y_min'], right_fit['y_min'], 20.0)
+            overlap_max = min(left_fit['y_max'], right_fit['y_max'], 590.0)
+            if overlap_max - overlap_min < 12.0:
+                continue
+            y_check = (overlap_min + overlap_max) / 2.0
+            left_x = left_fit['k'] * y_check + left_fit['b']
+            right_x = right_fit['k'] * y_check + right_fit['b']
+            width = right_x - left_x
+            slope_diff = abs(left_fit['k'] - right_fit['k'])
+            if not (IPM_LANE_WIDTH_MIN <= width <= IPM_LANE_WIDTH_MAX):
+                continue
+            if slope_diff > 0.55:
+                continue
+            # Prefer a long left marking, then a plausible 42 cm lane width.
+            score = (left_fit['span'] / 500.0 -
+                     abs(width - 2.0 * IPM_LANE_HALF_WIDTH) / 500.0 -
+                     slope_diff * 0.4)
+            if best is None or score > best['score']:
+                best = {
+                    'score': score,
+                    'left_fit': left_fit,
+                    'right_fit': right_fit,
+                    'measured_width': float(width),
+                    'slope_diff': float(slope_diff),
+                }
+
+    if best is None:
+        return None
+
+    left_fit = best['left_fit']
+    # For x=k*y+b, this intercept shift offsets the parallel line by the
+    # requested perpendicular distance in the metric-like IPM plane.
+    center_k = left_fit['k']
+    center_b = (left_fit['b'] +
+                IPM_LANE_HALF_WIDTH * math.sqrt(1.0 + center_k * center_k))
+    y_near = 585.0
+    y_far = max(40.0, min(left_fit['y_min'], best['right_fit']['y_min']))
+    center_near = center_k * y_near + center_b
+    heading_deg = math.degrees(math.atan2(-center_k, 1.0))
+
+    y_values = np.linspace(y_far, y_near, 36)
+    center_ipm = np.float32([
+        [center_k * y + center_b, y] for y in y_values
+    ]).reshape(-1, 1, 2)
+    raw_points = cv2.perspectiveTransform(center_ipm, IPM_INV_MATRIX).reshape(-1, 2)
+    h, w = mask_shape
+    overlay_points = []
+    for x, y in raw_points:
+        point = (int(round(639.0 - x)), int(round(y)))
+        if -80 <= point[0] < w + 80 and 0 <= point[1] < h:
+            overlay_points.append(point)
+
+    best.update({
+        'k': float(center_k),
+        'b': float(center_b),
+        'center_error': float(center_near - IPM_CENTER_X),
+        'heading_error_deg': float(heading_deg),
+        'overlay_points': overlay_points,
+    })
+    return best
+
+
+def detect_dual_lane_ipm(contours, mask_shape):
+    """Find two current-frame parallel boundaries and their actual centerline."""
+    if IPM_MATRIX is None or IPM_INV_MATRIX is None:
+        return None
+    fits = [fit for fit in (contour_ipm_fit(c) for c in contours[:6]) if fit]
+    best = None
+    for i in range(len(fits)):
+        for j in range(i + 1, len(fits)):
+            first, second = fits[i], fits[j]
+            overlap_min = max(first['y_min'], second['y_min'], 80.0)
+            overlap_max = min(first['y_max'], second['y_max'], 590.0)
+            if overlap_max - overlap_min < 70:
+                continue
+            y_near = overlap_max
+            y_far = max(overlap_min, y_near - 160.0)
+            f_near = first['k'] * y_near + first['b']
+            s_near = second['k'] * y_near + second['b']
+            f_far = first['k'] * y_far + first['b']
+            s_far = second['k'] * y_far + second['b']
+            width_near = abs(s_near - f_near)
+            width_far = abs(s_far - f_far)
+            slope_diff = abs(first['k'] - second['k'])
+            if not (IPM_LANE_WIDTH_MIN <= width_near <= IPM_LANE_WIDTH_MAX):
+                continue
+            if not (IPM_LANE_WIDTH_MIN <= width_far <= IPM_LANE_WIDTH_MAX):
+                continue
+            if slope_diff > 0.30 or abs(width_near - width_far) > 90:
+                continue
+            score = slope_diff + abs((width_near + width_far) / 2.0 - 400.0) / 400.0
+            if best is None or score < best['score']:
+                k_center = (first['k'] + second['k']) / 2.0
+                b_center = (first['b'] + second['b']) / 2.0
+                # Forward travel in the IPM plane is toward decreasing y.
+                heading_deg = math.degrees(math.atan2(-k_center, 1.0))
+                center_near = k_center * y_near + b_center
+                best = {
+                    'score': score,
+                    'left_fit': first if f_near < s_near else second,
+                    'right_fit': second if f_near < s_near else first,
+                    'k': k_center, 'b': b_center,
+                    'center_error': float(center_near - IPM_CENTER_X),
+                    'heading_error_deg': float(heading_deg),
+                    'lane_width': float((width_near + width_far) / 2.0),
+                    'y_min': y_far, 'y_max': y_near,
+                }
+    if best is None:
+        return None
+
+    y_values = np.linspace(best['y_min'], best['y_max'], 24)
+    ipm_center = np.float32([
+        [best['k'] * y + best['b'], y] for y in y_values
+    ]).reshape(-1, 1, 2)
+    raw_center = cv2.perspectiveTransform(ipm_center, IPM_INV_MATRIX).reshape(-1, 2)
+    h, w = mask_shape
+    overlay_points = []
+    for x, y in raw_center:
+        point = (int(round(639.0 - x)), int(round(y)))
+        if 0 <= point[0] < w and 0 <= point[1] < h:
+            overlay_points.append(point)
+    best['overlay_points'] = overlay_points
+    return best
+
+
 def make_mask(frame, params):
     blur_k = int(params.get('blur_ksize', 0))
     if blur_k >= 3:
@@ -320,6 +575,32 @@ def polyline_corner(points, width):
     return best[1] if best and best[0] > 18 else None
 
 
+def current_frame_row_guide(points, image_width):
+    """Measure the current two-edge centerline using last year's row scan idea."""
+    if len(points) < ROW_GUIDE_MIN_POINTS:
+        return None
+
+    near_count = min(5, len(points))
+    far_count = min(5, len(points))
+    near_x = float(np.mean([p[0] for p in points[:near_count]]))
+    far_x = float(np.mean([p[0] for p in points[-far_count:]]))
+    near_y = float(np.mean([p[1] for p in points[:near_count]]))
+    far_y = float(np.mean([p[1] for p in points[-far_count:]]))
+    forward_pixels = near_y - far_y
+    if forward_pixels < 45.0:
+        return None
+
+    # Positive heading means the lane heads toward display-right. The frame is
+    # mirrored, so control below explicitly accounts for this display sign.
+    heading_deg = math.degrees(math.atan2(far_x - near_x, forward_pixels))
+    return {
+        'points': list(points),
+        'point_count': len(points),
+        'center_error': near_x - image_width / 2.0,
+        'heading_error_deg': heading_deg,
+    }
+
+
 def analyze_lanes(mask):
     h, w = mask.shape
     result = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
@@ -363,6 +644,10 @@ def analyze_lanes(mask):
                 centers.append((cand_x, y))
                 edge_samples.append(((left_x, y), (right_x, y)))
 
+    # Preserve current-frame geometry before the diagnostic history fallback.
+    current_centers = list(centers)
+    row_guide = current_frame_row_guide(current_centers, w)
+
     # 【借鉴去年逻辑 2：历史中线记忆】
     center_error = None
     if len(centers) >= 3:
@@ -400,11 +685,12 @@ def analyze_lanes(mask):
         if (rx + rcw / 2 > w * 0.45 and rlength > 80 and is_parallel):
             right_edge = right_c
 
-    virt_near_err, virt_centers, dashed_segs = get_virtual_extended_midline(right_edge, mask.shape)
+    entry_guide = build_entry_guide_ipm(contours, mask.shape)
+    dual_lane = detect_dual_lane_ipm(contours, mask.shape)
 
     return (left_c, right_c, left_midline, right_midline, corners, centers,
             edge_samples, center_error, right_edge, left_slope, right_slope, slope_diff,
-            virt_near_err, dashed_segs)
+            row_guide, entry_guide, dual_lane)
 
 
 def image_cb(msg):
@@ -424,7 +710,7 @@ def image_cb(msg):
         mask, roi = make_mask(frame, hsv_p)
         (left, right, left_midline, right_midline, corners, centers, samples,
          error, right_edge, left_slope, right_slope, slope_diff,
-         virt_near_err, dashed_segs) = analyze_lanes(mask)
+         row_guide, entry_guide, dual_lane) = analyze_lanes(mask)
 
         overlay = frame.copy()
         cv2.rectangle(overlay, (roi[0], roi[1]), (roi[2] - 1, roi[3] - 1), (255, 120, 0), 2)
@@ -442,13 +728,32 @@ def image_cb(msg):
             cv2.polylines(overlay, [np.array(centers, np.int32)], False, (0, 255, 0), 3)
         for point in corners:
             cv2.circle(overlay, point, 9, (255, 0, 255), 3)
+
+        if row_guide is not None:
+            cv2.polylines(overlay, [np.array(row_guide['points'], np.int32)],
+                          False, (0, 255, 0), 5)
+            cv2.putText(overlay, 'CURRENT ROW-SCAN CENTER', (220, 105),
+                        cv2.FONT_HERSHEY_SIMPLEX, .5, (0, 255, 0), 2)
+
+        if entry_guide is not None:
+            points = entry_guide['overlay_points']
+            for index in range(0, len(points) - 1, 2):
+                cv2.line(overlay, points[index], points[index + 1], (0, 255, 0), 4)
+            cv2.drawContours(overlay, [entry_guide['left_fit']['contour']],
+                             -1, (0, 255, 255), 4)
+            cv2.drawContours(overlay, [entry_guide['right_fit']['contour']],
+                             -1, (255, 0, 255), 3)
+            cv2.putText(overlay, 'ENTRY GUIDE (LONG LEFT + SHORT RIGHT)',
+                        (175, 80), cv2.FONT_HERSHEY_SIMPLEX, .5, (0, 255, 0), 2)
         
-        # 绘制向小车方向 (画面底部) 延伸的绿色虚拟中线 (虚线)
-        if len(dashed_segs) > 0:
-            for p1, p2 in dashed_segs:
-                cv2.line(overlay, p1, p2, (0, 255, 0), 3)
-            cv2.putText(overlay, 'VIRTUAL DASHED MIDLINE', (260, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, .55, (0, 255, 0), 2)
+        if dual_lane is not None:
+            cv2.drawContours(overlay, [dual_lane['left_fit']['contour']], -1, (255, 0, 255), 3)
+            cv2.drawContours(overlay, [dual_lane['right_fit']['contour']], -1, (255, 0, 255), 3)
+            if len(dual_lane['overlay_points']) > 1:
+                cv2.polylines(overlay, [np.array(dual_lane['overlay_points'], np.int32)],
+                              False, (255, 255, 0), 4)
+            cv2.putText(overlay, 'CURRENT DUAL-LANE CENTER', (230, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, .55, (255, 255, 0), 2)
 
         if right_edge is not None:
             cv2.drawContours(overlay, [right_edge], -1, (0, 255, 255), 3)
@@ -462,7 +767,35 @@ def image_cb(msg):
             state.left_slope = left_slope
             state.right_slope = right_slope
             state.slope_diff = slope_diff
-            state.virtual_center_error = virt_near_err
+            state.virtual_center_error = None
+            state.dual_lane_valid = dual_lane is not None
+            state.lane_center_error = dual_lane['center_error'] if dual_lane else None
+            state.lane_heading_error_deg = dual_lane['heading_error_deg'] if dual_lane else None
+            state.lane_width_ipm = dual_lane['lane_width'] if dual_lane else None
+            state.entry_guide_valid = entry_guide is not None
+            state.entry_guide_confirmed = entry_guide is not None
+            state.entry_guide_center_error = entry_guide['center_error'] if entry_guide else None
+            state.entry_guide_heading_error_deg = entry_guide['heading_error_deg'] if entry_guide else None
+            state.row_guide_valid = row_guide is not None
+            state.row_guide_center_error = row_guide['center_error'] if row_guide else None
+            state.row_guide_heading_error_deg = row_guide['heading_error_deg'] if row_guide else None
+            state.row_guide_points = row_guide['point_count'] if row_guide else 0
+
+            if state.mode == 'ENTER_LANE_ARC':
+                guide_aligned = (entry_guide is not None and
+                                 abs(entry_guide['center_error']) <= ALIGN_CENTER_TOL_PX and
+                                 abs(entry_guide['heading_error_deg']) <= ALIGN_HEADING_TOL_DEG)
+                state.entry_guide_good_frames = (state.entry_guide_good_frames + 1
+                                                 if guide_aligned else 0)
+                row_heading_residual = (row_guide['heading_error_deg'] -
+                                        ROW_GUIDE_HEADING_TARGET_DEG
+                                        if row_guide is not None else None)
+                row_aligned = (state.turn_deg >= ROW_GUIDE_ACCEPT_MIN_TURN_DEG and
+                               row_guide is not None and
+                               abs(row_guide['center_error']) <= ROW_GUIDE_CENTER_TOL_PX and
+                               abs(row_heading_residual) <= ROW_GUIDE_HEADING_TOL_DEG)
+                state.row_guide_good_frames = (state.row_guide_good_frames + 1
+                                               if row_aligned else 0)
             
             if state.mode == 'SEARCH_RIGHT' and state.turn_deg >= SEARCH_START_DEG:
                 # 严密判定：既要找到合格且通过 IPM 斜率校验的右出口车道线 (right_edge is not None)，
@@ -473,6 +806,25 @@ def image_cb(msg):
                 else:
                     state.right_edge_frames = max(0, state.right_edge_frames - 1)
                 state.right_edge_found = (state.right_edge_frames >= EDGE_CONFIRM_FRAMES)
+
+            if state.mode == 'ENTER_LANE_ARC':
+                if (state.turn_deg >= DUAL_ACCEPT_MIN_TURN_DEG and
+                        dual_lane is not None):
+                    state.dual_lane_frames += 1
+                else:
+                    state.dual_lane_frames = 0
+
+            if state.mode == 'ALIGN_BETWEEN_LINES':
+                if dual_lane is not None:
+                    state.dual_lane_frames += 1
+                else:
+                    state.dual_lane_frames = max(0, state.dual_lane_frames - 1)
+
+            if state.mode == 'ALIGN_BETWEEN_LINES':
+                aligned = (dual_lane is not None and
+                           abs(dual_lane['center_error']) <= ALIGN_CENTER_TOL_PX and
+                           abs(dual_lane['heading_error_deg']) <= ALIGN_HEADING_TOL_DEG)
+                state.align_good_frames = state.align_good_frames + 1 if aligned else 0
 
             status = state.status()
 
@@ -501,9 +853,16 @@ def odom_cb(msg):
             dy = state.odom[1] - state.start_pose[1]
             state.distance = math.hypot(dx, dy)
             state.turn_deg = max(0.0, -math.degrees(normalize_angle(yaw - state.start_pose[2])))
+        if state.phase_start_pose:
+            phase_dx = state.odom[0] - state.phase_start_pose[0]
+            phase_dy = state.odom[1] - state.phase_start_pose[1]
+            state.phase_distance = math.hypot(phase_dx, phase_dy)
 
 
 def publish_stop():
+    state.control_source = 'STOPPED'
+    state.command_linear_x = 0.0
+    state.command_angular_z = 0.0
     if cmd_pub is not None:
         cmd_pub.publish(Twist())
 
@@ -514,11 +873,22 @@ def fail_locked(message):
     publish_stop()
 
 
+def begin_phase_locked(mode, message, now):
+    """Begin a motion phase with an independent odometry distance origin."""
+    state.mode = mode
+    state.message = message
+    state.state_started = now
+    state.phase_start_pose = state.odom
+    state.phase_distance = 0.0
+    publish_stop()
+
+
 def control_timer(_event):
     with state.lock:
         now = time.time()
         mode = state.mode
-        if mode not in ('ADVANCE', 'SEARCH_RIGHT', 'ENTRY_GUIDED'):
+        if mode not in ('ADVANCE', 'SEARCH_RIGHT', 'ENTER_LANE_ARC',
+                        'ALIGN_BETWEEN_LINES'):
             return
         if state.odom is None or now - state.last_image_time > 0.6:
             fail_locked('里程计不可用或相机超时，已停车')
@@ -537,50 +907,135 @@ def control_timer(_event):
             cmd.linear.x = ADVANCE_SPEED
             yaw_error = normalize_angle(state.start_pose[2] - state.odom[2])
             cmd.angular.z = max(-0.08, min(0.08, 0.8 * yaw_error))
+            state.control_source = 'ADVANCE_ODOM'
         elif mode == 'SEARCH_RIGHT':
             if state.right_edge_found:
-                state.mode = 'ENTRY_GUIDED'
-                state.entry_start_dist = state.distance
-                state.state_started = now
-                state.message = '延伸虚线引导：驶入右转车道正中央'
-                publish_stop()
+                state.dual_lane_frames = 0
+                state.align_good_frames = 0
+                begin_phase_locked('ENTER_LANE_ARC',
+                                   '已锁定右出口，低速弧线继续驶入并寻找真实双边线', now)
                 return
             if state.turn_deg >= ROTATE_LIMIT_DEG or now - state.state_started > ROTATE_TIMEOUT:
                 fail_locked('达到60度/超时仍未稳定找到右边界')
                 return
             cmd.angular.z = -ROTATE_SPEED
-        elif mode == 'ENTRY_GUIDED':
-            entry_dist = state.distance - state.entry_start_dist
-            virt_err = state.virtual_center_error
-            
-            # 若延伸中线像素偏离可用，进行闭环调节；若无，默认微调圆弧
-            if virt_err is not None:
-                rot = - (0.0035 * virt_err)
-                rot = max(-0.45, min(0.10, rot)) - 0.15
+            state.control_source = 'SEARCH_RIGHT_ODOM'
+        elif mode == 'ENTER_LANE_ARC':
+            # Completion checks must run before timeout checks. Otherwise a
+            # frame that has just become valid at 12 s would be mislabeled as
+            # a timeout even though the vehicle is already in the lane.
+            if (state.phase_distance >= ENTRY_GUIDE_MIN_DISTANCE and
+                    state.row_guide_good_frames >= ROW_GUIDE_CONFIRM_FRAMES):
+                state.mode = 'ENTERED_STOPPED'
+                state.message = '当前帧双边中线已稳定确认，已驶入右转车道并停车'
+                publish_stop()
+                return
+
+            if (state.phase_distance >= ENTRY_GUIDE_MIN_DISTANCE and
+                    state.entry_guide_good_frames >= ENTRY_GUIDE_CONFIRM_FRAMES):
+                state.mode = 'ENTERED_STOPPED'
+                state.message = 'IPM驶入引导已稳定确认，已驶入右转车道并停车'
+                publish_stop()
+                return
+
+            # Only accept a dual-lane pair after most of the right turn; this
+            # prevents the entrance pair from triggering an early handover.
+            if (state.turn_deg >= DUAL_ACCEPT_MIN_TURN_DEG and
+                    state.dual_lane_frames >= DUAL_EDGE_CONFIRM_FRAMES):
+                state.align_good_frames = 0
+                begin_phase_locked('ALIGN_BETWEEN_LINES',
+                                   '真实双边线已确认，沿当前帧车道中线低速对准', now)
+                return
+            if (state.phase_distance > ENTRY_ARC_MAX_DISTANCE or
+                    state.turn_deg > ENTRY_ARC_MAX_TURN_DEG or
+                    now - state.state_started > ENTRY_ARC_TIMEOUT):
+                fail_locked('弧线驶入超距/超角/超时，已停车')
+                return
+
+            if (state.turn_deg >= ROW_GUIDE_ACCEPT_MIN_TURN_DEG and
+                    state.row_guide_valid):
+                center_error = state.row_guide_center_error
+                heading_raw = state.row_guide_heading_error_deg
+                if center_error is None or heading_raw is None:
+                    publish_stop()
+                    return
+
+                # The perspective row-scan has a measured straight-ahead bias
+                # of about +14 deg. Use only the residual; otherwise that bias
+                # overwhelms the lateral term and incorrectly commands left.
+                heading_error = heading_raw - ROW_GUIDE_HEADING_TARGET_DEG
+                rot = (-0.18 * math.radians(heading_error) -
+                       0.00045 * center_error)
+                cmd.linear.x = ALIGN_SPEED
+                cmd.angular.z = max(-0.08, min(0.08, rot))
+                state.control_source = 'ROW_GUIDE'
+
+            elif state.entry_guide_valid:
+                center_error = state.entry_guide_center_error
+                heading_error = state.entry_guide_heading_error_deg
+                if center_error is None or heading_error is None:
+                    publish_stop()
+                    return
+
+                # Positive IPM errors put the guide to the physical right;
+                # command negative angular.z (right turn). Both signs are
+                # permitted so the vehicle can straighten or correct left.
+                rot = (-0.65 * math.radians(heading_error) -
+                       0.00075 * center_error)
+                cmd.linear.x = ENTRY_ARC_SPEED
+                cmd.angular.z = max(-0.14, min(0.12, rot))
+                state.control_source = 'IPM_ENTRY_GUIDE'
             else:
-                rot = -0.30
-                
-            # 切入成功判定：推进约 22~35cm，且偏离像素 <= 35px (说明小车已在右转车道正中央对齐)
-            if entry_dist >= 0.22 and (virt_err is not None and abs(virt_err) <= 35.0):
-                state.mode = 'ARRIVED_CENTER'
-                state.message = '已成功驶入右转车道正中央！'
+                # No trusted long-left + short-right geometry: creep while
+                # approaching 68 deg, but never blindly turn beyond 72 deg.
+                if state.turn_deg >= ENTRY_ARC_BLIND_STOP_DEG:
+                    fail_locked('到达72度仍无可信驶入虚线，已停车防止转过头')
+                    return
+                yaw_error_deg = ENTRY_ARC_BLIND_TARGET_DEG - state.turn_deg
+                cmd.linear.x = ENTRY_ARC_BLIND_SPEED
+                cmd.angular.z = max(-0.10, min(0.0, -0.008 * yaw_error_deg))
+                state.control_source = 'BLIND_ODOM_RIGHT'
+
+        elif mode == 'ALIGN_BETWEEN_LINES':
+            if (state.phase_distance > ALIGN_MAX_DISTANCE or
+                    now - state.state_started > ALIGN_TIMEOUT):
+                fail_locked('双边线对准超距/超时，未达到驶入成功条件')
+                return
+            if not state.dual_lane_valid:
+                # Never steer using historical or invented lane geometry.
                 publish_stop()
                 return
-            if entry_dist > 0.35 or now - state.state_started > 6.0:
-                state.mode = 'ARRIVED_CENTER'
-                state.message = '已到达右转车道中间位置 (距离/时间限制触发)'
+
+            center_error = state.lane_center_error
+            heading_error = state.lane_heading_error_deg
+            if center_error is None or heading_error is None:
                 publish_stop()
                 return
-                
-            cmd.linear.x = 0.12
-            cmd.angular.z = rot
+
+            if (state.phase_distance >= ALIGN_MIN_DISTANCE and
+                    state.align_good_frames >= ALIGN_CONFIRM_FRAMES):
+                state.mode = 'ENTERED_STOPPED'
+                state.message = '已完整驶入右转车道并对准，验证任务停车'
+                publish_stop()
+                return
+
+            # ROS angular.z > 0 turns left. Positive IPM errors mean the
+            # current centerline is to the right, so command a right turn.
+            heading_rad = math.radians(heading_error)
+            rot = -0.75 * heading_rad - 0.0009 * center_error
+            cmd.linear.x = ALIGN_SPEED
+            cmd.angular.z = max(-0.16, min(0.16, rot))
+            state.control_source = 'IPM_DUAL_ALIGN'
+        state.command_linear_x = cmd.linear.x
+        state.command_angular_z = cmd.angular.z
         cmd_pub.publish(cmd)
 
 
-PAGE = '''<!doctype html><meta charset="utf-8"><title>右转验证终端 (IPM 鸟瞰图平行校验版)</title>
+PAGE = '''<!doctype html><meta charset="utf-8"><title>右转车道驶入验证</title>
 <style>body{font:16px sans-serif;background:#0f172a;color:#f8fafc;margin:20px}main{max-width:1100px;margin:auto}section{background:#1e293b;padding:16px;margin:12px 0;border-radius:10px}img{width:48%;background:#111;margin:1%;border-radius:6px}.start{background:#1677ff;color:white}.stop{background:#d00;color:white}button{padding:12px 22px;border:0;border-radius:6px;margin-right:10px;font-size:16px;cursor:pointer}pre{font-size:15px;background:#0f172a;padding:10px;border-radius:6px;color:#38bdf8}</style>
-<main><h2>右转简单验证控制台 (直行 25cm + IPM 鸟瞰图平行匹配)</h2>
+<main><h2>右转车道驶入验证</h2>
 <section><b>默认不运动。确认场地清空并准备实体急停后再启动。</b>
+<p>流程：入口前进 → 搜索右出口 → 低速弧线驶入 → 当前帧双边线对准 → 停车。</p>
 <p><button class="start" onclick="post('/api/start')">解锁并开始</button><button class="stop" onclick="post('/api/stop')">立即停车</button><button onclick="post('/api/reset')">复位为仅感知</button></p>
 <pre id="status">加载状态中...</pre></section>
 <section><h3>识别叠加图 (/right_turn/debug/overlay) 与 二值图 (/right_turn/debug/mask)</h3>
@@ -632,7 +1087,7 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         with state.lock:
             if path == '/api/start':
-                if state.mode not in ('DISARMED', 'FAULT', 'EDGE_FOUND', 'ARRIVED_CENTER'):
+                if state.mode not in ('DISARMED', 'FAULT', 'ENTERED_STOPPED'):
                     self.reply({'ok': False, 'error': '任务已经运行'})
                     return
                 if state.odom is None:
@@ -648,6 +1103,12 @@ class Handler(BaseHTTPRequestHandler):
                 state.distance = state.turn_deg = 0.0
                 state.right_edge_frames = 0
                 state.right_edge_found = False
+                state.phase_start_pose = None
+                state.phase_distance = 0.0
+                state.dual_lane_frames = 0
+                state.align_good_frames = 0
+                state.entry_guide_good_frames = 0
+                state.row_guide_good_frames = 0
                 state.mode = 'ADVANCE'
                 state.state_started = time.time()
                 state.message = '低速前进25厘米'
@@ -664,6 +1125,12 @@ class Handler(BaseHTTPRequestHandler):
                 state.distance = state.turn_deg = 0.0
                 state.right_edge_frames = 0
                 state.right_edge_found = False
+                state.phase_start_pose = None
+                state.phase_distance = 0.0
+                state.dual_lane_frames = 0
+                state.align_good_frames = 0
+                state.entry_guide_good_frames = 0
+                state.row_guide_good_frames = 0
                 publish_stop()
                 self.reply({'ok': True})
             else:
@@ -708,5 +1175,5 @@ if __name__ == '__main__':
     rospy.Timer(rospy.Duration(0.05), control_timer)
     rospy.on_shutdown(shutdown)
     server = ReusableHTTPServer(('0.0.0.0', PORT), Handler)
-    rospy.loginfo('右转验证节点已启动 (直行 25cm + IPM 鸟瞰图平行匹配模式): http://0.0.0.0:%d', PORT)
+    rospy.loginfo('右转车道驶入节点已启动（默认仅感知）: http://0.0.0.0:%d', PORT)
     server.serve_forever()
