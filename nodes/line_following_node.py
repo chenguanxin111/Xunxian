@@ -215,129 +215,97 @@ def extract_line_centers_ipm(mask):
         pts[:, 0, 0] = 639.0 - pts[:, 0, 0]  # 还原镜像
         ipm_pts = cv2.perspectiveTransform(pts, IPM_MATRIX).reshape(-1, 2)
         ipm_pts = ipm_pts[np.isfinite(ipm_pts).all(axis=1)]
-        ipm_pts = ipm_pts[(ipm_pts[:, 0] > -200) & (ipm_pts[:, 0] < 800) &
-                          (ipm_pts[:, 1] > 0) & (ipm_pts[:, 1] < 600)]
-        if len(ipm_pts) >= 10 and np.ptp(ipm_pts[:, 1]) > 40:
-            k, b = np.polyfit(ipm_pts[:, 1], ipm_pts[:, 0], 1)
-            # 过滤横向停止线、白板边缘 (斜率不能太横向)
-            if abs(k) < 1.5:
+        # 限制在地面有效区域内
+        ipm_pts = ipm_pts[(ipm_pts[:, 0] > -100) & (ipm_pts[:, 0] < 700) &
+                          (ipm_pts[:, 1] > 50) & (ipm_pts[:, 1] < 600)]
+                          
+        if len(ipm_pts) >= 15 and np.ptp(ipm_pts[:, 1]) > 50:
+            ys = ipm_pts[:, 1]
+            xs = ipm_pts[:, 0]
+            # 拟合 2 次多项式 x = a*y^2 + b*y + c
+            poly = np.polyfit(ys, xs, 2)
+            # 计算底端 (y=550) 预测 X，用于过滤横向线和区分左右
+            bottom_x = poly[0] * (550.0**2) + poly[1] * 550.0 + poly[2]
+            # 检查导数/斜率，过滤横向停止线
+            slope_bottom = 2 * poly[0] * 550.0 + poly[1]
+            if abs(slope_bottom) < 1.8:
                 fits.append({
-                    'k': float(k), 'b': float(b),
-                    'y_min': float(np.min(ipm_pts[:, 1])),
-                    'y_max': float(np.max(ipm_pts[:, 1])),
-                    'span': float(np.ptp(ipm_pts[:, 1])),
-                    'contour': c
+                    'poly': poly,
+                    'bottom_x': float(bottom_x),
+                    'span': float(np.ptp(ys)),
+                    'y_min': float(np.min(ys)),
+                    'y_max': float(np.max(ys))
                 })
 
     if not fits:
         return [], [], 0.0, 0.0, clean_mask
 
+    # 依据上一帧记录的中线，进行左右车道线分类 (记忆防跳变)
     expected_mid_x = getattr(state, 'last_ipm_mid_x', 300.0)
     
-    left_ipm_pts = []
-    right_ipm_pts = []
+    left_fits = [f for f in fits if f['bottom_x'] < expected_mid_x]
+    right_fits = [f for f in fits if f['bottom_x'] >= expected_mid_x]
 
-    for c in contours[:4]:
-        pts = c.reshape(-1, 1, 2).astype(np.float32).copy()
-        pts[:, 0, 0] = 639.0 - pts[:, 0, 0]  # 还原镜像
-        ipm_pts = cv2.perspectiveTransform(pts, IPM_MATRIX).reshape(-1, 2)
-        ipm_pts = ipm_pts[np.isfinite(ipm_pts).all(axis=1)]
-        ipm_pts = ipm_pts[(ipm_pts[:, 0] > -200) & (ipm_pts[:, 0] < 800) &
-                          (ipm_pts[:, 1] > 0) & (ipm_pts[:, 1] < 600)]
-                          
-        if len(ipm_pts) >= 10 and np.ptp(ipm_pts[:, 1]) > 40:
-            k, b = np.polyfit(ipm_pts[:, 1], ipm_pts[:, 0], 1)
-            # 过滤横向停止线
-            if abs(k) < 1.5:
-                # 使用该段轮廓向下延伸到底部的预测 X 来区分左右
-                bottom_x = k * 550.0 + b
-                if bottom_x < expected_mid_x:
-                    left_ipm_pts.extend(ipm_pts)
-                else:
-                    right_ipm_pts.extend(ipm_pts)
+    lf = max(left_fits, key=lambda f: f['span']) if left_fits else None
+    rf = max(right_fits, key=lambda f: f['span']) if right_fits else None
 
-    if not left_ipm_pts and not right_ipm_pts:
+    # 左右双线冲突校验
+    if lf and rf:
+        w_bottom = rf['bottom_x'] - lf['bottom_x']
+        if w_bottom < 200.0 or w_bottom > 550.0:
+            # 宽带异常，优先保更长的线
+            if lf['span'] >= rf['span']:
+                rf = None
+            else:
+                lf = None
+
+    # 构建最终中线多项式 P_mid(y) = a*y^2 + b*y + c
+    IPM_HALF_LANE_WIDTH = 200.0
+    
+    if lf and rf:
+        # 双侧都有：中线多项式为左右系数直接取平均
+        poly_mid = (lf['poly'] + rf['poly']) / 2.0
+    elif lf:
+        # 仅左侧：多项式向右平移 200px (常数项 c + 200)
+        poly_mid = lf['poly'].copy()
+        poly_mid[2] += IPM_HALF_LANE_WIDTH
+    elif rf:
+        # 仅右侧：多项式向左平移 200px (常数项 c - 200)
+        poly_mid = rf['poly'].copy()
+        poly_mid[2] -= IPM_HALF_LANE_WIDTH
+    else:
         return [], [], 0.0, 0.0, clean_mask
 
-    # 动态计算当前画面的实际半车道宽度，消除硬编码 200 导致的中心线折线跳变 (Zigzag)
-    overlap_widths = []
-    for y_bin in range(590, 50, -20):
-        l_xs = [p[0] for p in left_ipm_pts if abs(p[1] - y_bin) <= 15]
-        r_xs = [p[0] for p in right_ipm_pts if abs(p[1] - y_bin) <= 15]
-        if l_xs and r_xs:
-            overlap_widths.append(np.mean(r_xs) - np.mean(l_xs))
-            
-    if overlap_widths:
-        dynamic_half_width = np.mean(overlap_widths) / 2.0
-        # 限制在合理物理范围内 (120~280 px)
-        if not (120.0 < dynamic_half_width < 280.0):
-            dynamic_half_width = getattr(state, 'last_half_width', 200.0)
-    else:
-        dynamic_half_width = getattr(state, 'last_half_width', 200.0)
-        
-    state.last_half_width = dynamic_half_width
+    # 生成采样点 (从车头 y=550 延伸到远处 y=150)
+    y_steps = np.linspace(150.0, 550.0, num=30)
+    x_steps = poly_mid[0] * (y_steps**2) + poly_mid[1] * y_steps + poly_mid[2]
+    
+    # 记忆底端中线 X，供下一帧防跳变分类使用
+    bottom_mid_x = poly_mid[0] * (550.0**2) + poly_mid[1] * 550.0 + poly_mid[2]
+    state.last_ipm_mid_x = float(bottom_mid_x)
 
-    # 沿 Y 轴按步长向下聚合，提取无损曲率中线
-    center_trajectory = []
-    
-    # 从车头 (590) 往前扫到远处 (50)
-    for y_bin in range(590, 50, -20):  
-        l_xs = [p[0] for p in left_ipm_pts if abs(p[1] - y_bin) <= 15]
-        r_xs = [p[0] for p in right_ipm_pts if abs(p[1] - y_bin) <= 15]
-        
-        cand_x = []
-        if l_xs: cand_x.append(np.mean(l_xs) + dynamic_half_width)
-        if r_xs: cand_x.append(np.mean(r_xs) - dynamic_half_width)
-        
-        if cand_x:
-            center_trajectory.append([np.mean(cand_x), float(y_bin)])
+    # 1. 计算近端位置偏差 (y=550 处)
+    center_error_near = float(bottom_mid_x - 300.0)
 
-    if not center_trajectory:
-        return [], [], 0.0, 0.0, clean_mask
+    # 2. 计算弯道割线前瞻角度 (从 y=550 指向 y=250 的矢量)
+    x_near = bottom_mid_x
+    x_far = poly_mid[0] * (250.0**2) + poly_mid[1] * 250.0 + poly_mid[2]
+    dx = x_far - x_near
+    dy = 550.0 - 250.0  # 前向距离 = 300.0
+    angle_error_deg = float(math.degrees(math.atan2(dx, dy)))
 
-    center_trajectory = np.array(center_trajectory)
-    
-    # 获取近端点 (车头最近的点) 和 远端点 (视野前方的点) - 完美复现去年逻辑！
-    first_point = center_trajectory[0]  # y 最大，离车最近
-    
-    # 取往前约一半距离的点作为远端点，计算大视距割线角
-    # 这样即使单边丢失，平移后的点也自带完美曲率，算出的割线角极大，能瞬间抱死弯道！
-    middle_idx = min(len(center_trajectory) - 1, max(1, len(center_trajectory) // 2))
-    middle_point = center_trajectory[middle_idx]
-    
-    # 在 IPM 坐标系中计算割线角 (Y是朝下的，所以前方向是 -Y)
-    # dx = 远端X - 近端X (往右为正)
-    # dy = 近端Y - 远端Y (前向为正)
-    dx = middle_point[0] - first_point[0]
-    dy = first_point[1] - middle_point[1]
-    
-    # 当视野极短 (只有 1 个点) 时，退化为 0
-    if dy < 10:
-        angle_error_deg = 0.0
-    else:
-        angle_error_deg = math.degrees(math.atan2(dx, dy))
-        
-    # 计算近端位置误差
-    near_pts = center_trajectory[center_trajectory[:, 1] >= 400.0]
-    if len(near_pts) > 0:
-        center_error_near = float(np.mean(near_pts[:, 0]) - 300.0)
-    else:
-        center_error_near = float(first_point[0] - 300.0)
-        
-    # 动态记忆中线，防止下帧左右跳变
-    state.last_ipm_mid_x = float(first_point[0])
-
-    # 画图：利用逆矩阵 IPM_INV_MATRIX 将中线反向投影回相机原始视角
-    overlay_centers = []
-    ipm_mid_pts = center_trajectory.reshape(-1, 1, 2)
+    # 反向投影回相机原始视角叠加绘制
+    ipm_mid_pts = np.column_stack((x_steps, y_steps)).reshape(-1, 1, 2).astype(np.float32)
     raw_mid_pts = cv2.perspectiveTransform(ipm_mid_pts, IPM_INV_MATRIX).reshape(-1, 2)
+    
+    overlay_centers = []
     for x, y in raw_mid_pts:
         ox = int(round(639.0 - x))  # 镜像恢复
         oy = int(round(y))
         if 0 <= ox < w and 0 <= oy < h:
             overlay_centers.append((ox, oy))
 
-    return overlay_centers, [], float(angle_error_deg), float(center_error_near), clean_mask
+    return overlay_centers, [], angle_error_deg, center_error_near, clean_mask
 
 
 def extract_line_centers_fallback(mask):
