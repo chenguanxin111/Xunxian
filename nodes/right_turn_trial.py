@@ -65,9 +65,9 @@ ALIGN_CONFIRM_FRAMES = 10
 ENTRY_GUIDE_MIN_DISTANCE = 0.15
 ENTRY_GUIDE_CONFIRM_FRAMES = 8
 ROW_GUIDE_MIN_POINTS = 10
-ROW_GUIDE_CENTER_TOL_PX = 50.0
+ROW_GUIDE_CENTER_TOL_PX = 30.0
 ROW_GUIDE_HEADING_TARGET_DEG = 0.0
-ROW_GUIDE_HEADING_TOL_DEG = 15.0
+ROW_GUIDE_HEADING_TOL_DEG = 7.0
 ROW_GUIDE_CONFIRM_FRAMES = 6
 ROW_GUIDE_ACCEPT_MIN_TURN_DEG = 50.0
 
@@ -964,8 +964,8 @@ def control_timer(_event):
                 # of about +14 deg. Use only the residual; otherwise that bias
                 # overwhelms the lateral term and incorrectly commands left.
                 heading_error = heading_raw - ROW_GUIDE_HEADING_TARGET_DEG
-                rot = (-0.18 * math.radians(heading_error) -
-                       0.00045 * center_error)
+                rot = (-0.35 * math.radians(heading_error) -
+                       0.0006 * center_error)
                 cmd.linear.x = ALIGN_SPEED
                 cmd.angular.z = max(-0.08, min(0.08, rot))
                 state.control_source = 'ROW_GUIDE'
