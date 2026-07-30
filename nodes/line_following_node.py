@@ -259,8 +259,25 @@ def extract_line_centers_ipm(mask):
     if not left_ipm_pts and not right_ipm_pts:
         return [], [], 0.0, 0.0, clean_mask
 
-    # 沿 Y 轴按步长向下聚合（完美借鉴去年从下往上扫点的思想，保留全部弯道曲率！）
-    IPM_HALF_LANE_WIDTH = 200.0
+    # 动态计算当前画面的实际半车道宽度，消除硬编码 200 导致的中心线折线跳变 (Zigzag)
+    overlap_widths = []
+    for y_bin in range(590, 50, -20):
+        l_xs = [p[0] for p in left_ipm_pts if abs(p[1] - y_bin) <= 15]
+        r_xs = [p[0] for p in right_ipm_pts if abs(p[1] - y_bin) <= 15]
+        if l_xs and r_xs:
+            overlap_widths.append(np.mean(r_xs) - np.mean(l_xs))
+            
+    if overlap_widths:
+        dynamic_half_width = np.mean(overlap_widths) / 2.0
+        # 限制在合理物理范围内 (120~280 px)
+        if not (120.0 < dynamic_half_width < 280.0):
+            dynamic_half_width = getattr(state, 'last_half_width', 200.0)
+    else:
+        dynamic_half_width = getattr(state, 'last_half_width', 200.0)
+        
+    state.last_half_width = dynamic_half_width
+
+    # 沿 Y 轴按步长向下聚合，提取无损曲率中线
     center_trajectory = []
     
     # 从车头 (590) 往前扫到远处 (50)
@@ -269,8 +286,8 @@ def extract_line_centers_ipm(mask):
         r_xs = [p[0] for p in right_ipm_pts if abs(p[1] - y_bin) <= 15]
         
         cand_x = []
-        if l_xs: cand_x.append(np.mean(l_xs) + IPM_HALF_LANE_WIDTH)
-        if r_xs: cand_x.append(np.mean(r_xs) - IPM_HALF_LANE_WIDTH)
+        if l_xs: cand_x.append(np.mean(l_xs) + dynamic_half_width)
+        if r_xs: cand_x.append(np.mean(r_xs) - dynamic_half_width)
         
         if cand_x:
             center_trajectory.append([np.mean(cand_x), float(y_bin)])
