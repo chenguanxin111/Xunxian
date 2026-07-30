@@ -56,7 +56,7 @@ class SharedState:
         self.lock = threading.Lock()
         self.mode = 'DISARMED'
         self.message = '巡线节点已启动 (仅感知模式)'
-        self.last_image_time = 0.0
+        self.last_image_time = time.time()
         self.hsv_params = dict(DEFAULT_HSV)
         
         # 巡线数据
@@ -84,7 +84,7 @@ class SharedState:
             'command_linear_x': round(self.command_linear_x, 3),
             'command_linear_y': round(self.command_linear_y, 3),
             'command_angular_z': round(self.command_angular_z, 3),
-            'image_age_s': round(max(0.0, time.time() - self.last_image_time), 2),
+            'image_age_s': round(max(0.0, time.time() - self.last_image_time), 2) if self.last_image_time > 0 else 0.0,
         }
 
 
@@ -283,6 +283,10 @@ def extract_line_centers_fallback(mask):
 
 
 def image_cb(msg):
+    rospy.loginfo_throttle(1, "巡线节点成功收到摄像头图像帧！")
+    with state.lock:
+        state.last_image_time = time.time()
+        
     try:
         frame = bridge.imgmsg_to_cv2(msg, 'passthrough')
         if msg.encoding.lower() == 'rgb8':
@@ -319,7 +323,6 @@ def image_cb(msg):
                         cv2.FONT_HERSHEY_SIMPLEX, .6, (0, 255, 0), 2)
 
         with state.lock:
-            state.last_image_time = time.time()
             state.centers = centers
             state.angle_error = angle_error
             state.center_error = center_error
@@ -375,8 +378,8 @@ def control_timer(_event):
         else:
             kp_z, kd_z = PID_TABLE['curve_large']
 
-        # 动态 PD 角速度控制算法 + 近处偏离修正
-        angular_z = kp_z * angle_err - kd_z * state.delta_angular_z - 0.0012 * center_err
+        # 动态 PD 角速度控制算法 + 近处偏离修正 (修复横向偏差正反馈误打方向)
+        angular_z = kp_z * angle_err - kd_z * state.delta_angular_z + 0.0012 * center_err
         state.delta_angular_z = angular_z - state.last_angular_z
         state.last_angular_z = angular_z
 
