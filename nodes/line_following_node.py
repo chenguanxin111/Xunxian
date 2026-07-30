@@ -513,8 +513,20 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_error(404)
 
 
+import socket
+
+
 class ReusableHTTPServer(HTTPServer):
     allow_reuse_address = True
+
+    def server_bind(self):
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if hasattr(socket, 'SO_REUSEPORT'):
+            try:
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            except Exception:
+                pass
+        super().server_bind()
 
 
 def shutdown():
