@@ -79,12 +79,15 @@ class SharedState:
         self.left_slope = None
         self.right_slope = None
         self.slope_diff = None
+        self.virtual_center_error = None
+        self.entry_start_dist = 0.0
 
     def status(self):
         return {
             'mode': self.mode,
             'message': self.message,
             'center_error_px': self.center_error,
+            'virtual_center_error_px': round(self.virtual_center_error, 1) if self.virtual_center_error is not None else None,
             'corners': self.corners,
             'distance_m': round(self.distance, 3),
             'right_turn_deg': round(self.turn_deg, 1),
@@ -168,6 +171,64 @@ def get_contour_slope_ipm(contour):
     except Exception as e:
         rospy.logwarn_throttle(2, f"IPM 斜率计算异常: {e}")
         return None
+
+
+def get_virtual_extended_midline(right_edge, mask_shape):
+    """
+    当锁定右出口车道线 (right_edge) 时，将其向小车方向（画面底部 y=h-1）向下外推延伸，
+    并推算出虚拟的左边界与全高度绿色中线点集及虚线绘制段。
+    """
+    if right_edge is None or len(right_edge) < 5:
+        return None, [], []
+    
+    h, w = mask_shape
+    pts = right_edge.reshape(-1, 2)
+    ys = pts[:, 1]
+    xs = pts[:, 0]
+    
+    if np.max(ys) - np.min(ys) < 12:
+        return None, [], []
+    
+    try:
+        kr, br = np.polyfit(ys, xs, 1)
+    except Exception:
+        return None, [], []
+
+    # 标准车道像素宽度 (底部约 360px)
+    LANE_WIDTH_PX = 360.0
+    
+    y_min = int(np.min(ys))
+    y_max = h - 1  # 延伸至画面最底部 (小车车头前方)
+    
+    virtual_centers = []
+    dashed_segments = []
+    
+    y_step = 8
+    y_range = list(range(y_max, max(0, y_min - 20), -y_step))
+    
+    for idx, y in enumerate(y_range):
+        rx_ext = kr * y + br
+        lx_ext = rx_ext - LANE_WIDTH_PX
+        cx_ext = (rx_ext + lx_ext) / 2.0
+        
+        cx_int = int(round(cx_ext))
+        cy_int = int(y)
+        virtual_centers.append((cx_int, cy_int))
+        
+        # 每隔 1 个 y_step 绘制线段，留出 1 个 y_step 的空隙，形成标准绿虚线
+        if idx % 2 == 0:
+            next_y = max(0, y - y_step)
+            next_cx = int(round(kr * next_y + br - LANE_WIDTH_PX / 2.0))
+            dashed_segments.append(((cx_int, cy_int), (next_cx, int(next_y))))
+
+    if len(virtual_centers) < 3:
+        return None, [], []
+    
+    # 取最靠近小车（画面最底部）的 6 个点的平均偏离像素
+    near_points = virtual_centers[:min(6, len(virtual_centers))]
+    near_error = float(np.mean([p[0] for p in near_points]) - w / 2.0)
+    
+    return near_error, virtual_centers, dashed_segments
 
 
 def make_mask(frame, params):
@@ -325,8 +386,11 @@ def analyze_lanes(mask):
         if (rx + rcw / 2 > w * 0.45 and rlength > 80 and is_parallel):
             right_edge = right_c
 
+    virt_near_err, virt_centers, dashed_segs = get_virtual_extended_midline(right_edge, mask.shape)
+
     return (left_c, right_c, left_midline, right_midline, corners, centers,
-            edge_samples, center_error, right_edge, left_slope, right_slope, slope_diff)
+            edge_samples, center_error, right_edge, left_slope, right_slope, slope_diff,
+            virt_near_err, dashed_segs)
 
 
 def image_cb(msg):
@@ -345,7 +409,8 @@ def image_cb(msg):
 
         mask, roi = make_mask(frame, hsv_p)
         (left, right, left_midline, right_midline, corners, centers, samples,
-         error, right_edge, left_slope, right_slope, slope_diff) = analyze_lanes(mask)
+         error, right_edge, left_slope, right_slope, slope_diff,
+         virt_near_err, dashed_segs) = analyze_lanes(mask)
 
         overlay = frame.copy()
         cv2.rectangle(overlay, (roi[0], roi[1]), (roi[2] - 1, roi[3] - 1), (255, 120, 0), 2)
@@ -363,6 +428,14 @@ def image_cb(msg):
             cv2.polylines(overlay, [np.array(centers, np.int32)], False, (0, 255, 0), 3)
         for point in corners:
             cv2.circle(overlay, point, 9, (255, 0, 255), 3)
+        
+        # 绘制向小车方向 (画面底部) 延伸的绿色虚拟中线 (虚线)
+        if len(dashed_segs) > 0:
+            for p1, p2 in dashed_segs:
+                cv2.line(overlay, p1, p2, (0, 255, 0), 3)
+            cv2.putText(overlay, 'VIRTUAL DASHED MIDLINE', (260, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, .55, (0, 255, 0), 2)
+
         if right_edge is not None:
             cv2.drawContours(overlay, [right_edge], -1, (0, 255, 255), 3)
             cv2.putText(overlay, 'RIGHT EDGE CANDIDATE', (300, 55),
@@ -375,6 +448,7 @@ def image_cb(msg):
             state.left_slope = left_slope
             state.right_slope = right_slope
             state.slope_diff = slope_diff
+            state.virtual_center_error = virt_near_err
             
             if state.mode == 'SEARCH_RIGHT' and state.turn_deg >= SEARCH_START_DEG:
                 # 严密判定：既要找到合格且通过 IPM 斜率校验的右出口车道线 (right_edge is not None)，
@@ -430,7 +504,7 @@ def control_timer(_event):
     with state.lock:
         now = time.time()
         mode = state.mode
-        if mode not in ('ADVANCE', 'SEARCH_RIGHT'):
+        if mode not in ('ADVANCE', 'SEARCH_RIGHT', 'ENTRY_GUIDED'):
             return
         if state.odom is None or now - state.last_image_time > 0.6:
             fail_locked('里程计不可用或相机超时，已停车')
@@ -449,16 +523,43 @@ def control_timer(_event):
             cmd.linear.x = ADVANCE_SPEED
             yaw_error = normalize_angle(state.start_pose[2] - state.odom[2])
             cmd.angular.z = max(-0.08, min(0.08, 0.8 * yaw_error))
-        else:
+        elif mode == 'SEARCH_RIGHT':
             if state.right_edge_found:
-                state.mode = 'EDGE_FOUND'
-                state.message = '右边界已连续确认，验证版停车'
+                state.mode = 'ENTRY_GUIDED'
+                state.entry_start_dist = state.distance
+                state.state_started = now
+                state.message = '延伸虚线引导：驶入右转车道正中央'
                 publish_stop()
                 return
             if state.turn_deg >= ROTATE_LIMIT_DEG or now - state.state_started > ROTATE_TIMEOUT:
                 fail_locked('达到60度/超时仍未稳定找到右边界')
                 return
             cmd.angular.z = -ROTATE_SPEED
+        elif mode == 'ENTRY_GUIDED':
+            entry_dist = state.distance - state.entry_start_dist
+            virt_err = state.virtual_center_error
+            
+            # 若延伸中线像素偏离可用，进行闭环调节；若无，默认微调圆弧
+            if virt_err is not None:
+                rot = - (0.0035 * virt_err)
+                rot = max(-0.45, min(0.10, rot)) - 0.15
+            else:
+                rot = -0.30
+                
+            # 切入成功判定：推进约 22~35cm，且偏离像素 <= 35px (说明小车已在右转车道正中央对齐)
+            if entry_dist >= 0.22 and (virt_err is not None and abs(virt_err) <= 35.0):
+                state.mode = 'ARRIVED_CENTER'
+                state.message = '已成功驶入右转车道正中央！'
+                publish_stop()
+                return
+            if entry_dist > 0.35 or now - state.state_started > 6.0:
+                state.mode = 'ARRIVED_CENTER'
+                state.message = '已到达右转车道中间位置 (距离/时间限制触发)'
+                publish_stop()
+                return
+                
+            cmd.linear.x = 0.12
+            cmd.angular.z = rot
         cmd_pub.publish(cmd)
 
 
@@ -517,7 +618,7 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         with state.lock:
             if path == '/api/start':
-                if state.mode not in ('DISARMED', 'FAULT', 'EDGE_FOUND'):
+                if state.mode not in ('DISARMED', 'FAULT', 'EDGE_FOUND', 'ARRIVED_CENTER'):
                     self.reply({'ok': False, 'error': '任务已经运行'})
                     return
                 if state.odom is None:
