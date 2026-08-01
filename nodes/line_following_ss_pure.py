@@ -63,6 +63,10 @@ STOP_LINE_ROI_TOP_RATIO = 0.75     # 停止线检测区域限制为画面下方 
 STOP_LINE_WIDTH_RATIO = 0.70       # 外接矩形宽度占比阈值（相对画面宽度）
 STOP_LINE_THIN_RATIO = 0.30        # 外接矩形高度/宽度比上限（保证细长）
 CREEP_SPEED = 0.12                 # 检测到停止线后的蠕动速度 (m/s)
+# 车道线斜率匹配参数
+SLOPE_TOLERANCE = 0.3          # 左右两条车道线斜率差值上限（|slope_L - slope_R| <= tolerance）
+SLOPE_HIST_LEN = 4             # 用于计算每条边斜率的最小历史行数
+
 CREEP_DISTANCE = 0.05              # 蠕动前进距离 (m)，5cm
 
 
@@ -217,13 +221,16 @@ def new_get_yellow_lane_bin_img(frame, params=None):
     return origin_img, bin_img, mask
 
 
-def find_white_pixel_indices(img):
+def find_white_pixel_indices(img, recent_error_sign=0):
     current_red_points_zuixiamian = []
     height, width = img.shape
     sigle, double = 0, 0
     green_points = []
     red_points = []
     kanbujian = 0
+    # 斜率匹配：双边追踪
+    edge_L_xs, edge_R_xs, edge_ys = [], [], []
+    frozen_half_width = 0  # 最近一次通过斜率匹配确认的"半车道宽"
     for y in range(height - 1, -1, -4):
         white_indices = np.where(img[y] == 255)[0]
         if len(white_indices) == 0:
@@ -238,7 +245,12 @@ def find_white_pixel_indices(img):
             sigle += 1
             red_x = int(mean_indices[0])
             current_red_points.append(red_x)
-            if len(green_points) > 1:
+            # 单边：优先用冻结半宽补对面边（比补到0/639更合理）
+            if len(green_points) > 1 and frozen_half_width > 0:
+                last_green_x = green_points[-1][0]
+                virtual_red_x = red_x + frozen_half_width if red_x < last_green_x else red_x - frozen_half_width
+                virtual_red_x = max(0, min(width - 1, int(virtual_red_x)))
+            elif len(green_points) > 1:
                 last_green_x = green_points[-1][0]
                 second_last_green_x = green_points[-2][0]
                 virtual_red_x = 0 if last_green_x < second_last_green_x else width - 1
@@ -249,25 +261,72 @@ def find_white_pixel_indices(img):
             new_green_point = (int(avg_index), y)
         elif len(mean_indices) > 1:
             double += 1
-            for idx in mean_indices:
-                current_red_points.append(int(idx))
-            if len(current_red_points) == 2:
-                if abs(current_red_points[0] - current_red_points[1]) < width / 3:
-                    if abs(current_red_points[0] - width // 2) > abs(current_red_points[1] - width // 2):
-                        current_red_points = [current_red_points[1], width - 1 if current_red_points[1] < width // 2 else 0]
-                    else:
-                        current_red_points = [current_red_points[0], width - 1 if current_red_points[0] < width // 2 else 0]
-                avg_index = np.mean(current_red_points)
-                new_green_point = (int(avg_index), y)
-            else:
+            real_edges = sorted([int(idx) for idx in mean_indices])
+            # 选出左右各一个代表性边
+            if len(real_edges) == 2:
+                selected = real_edges
+            elif len(real_edges) > 2:
                 mid_x = width // 2
-                left_red_points = [pt for pt in current_red_points if pt < mid_x]
-                right_red_points = [pt for pt in current_red_points if pt >= mid_x]
-                left_nearest = min(left_red_points, key=lambda x: abs(x - mid_x)) if left_red_points else 0
-                right_nearest = min(right_red_points, key=lambda x: abs(x - mid_x)) if right_red_points else width - 1
-                current_red_points = [left_nearest, right_nearest]
-                avg_index = np.mean(current_red_points)
-                new_green_point = (int(avg_index), y)
+                left_edges = [e for e in real_edges if e < mid_x]
+                right_edges = [e for e in real_edges if e >= mid_x]
+                left_nearest = min(left_edges, key=lambda x: abs(x - mid_x)) if left_edges else 0
+                right_nearest = min(right_edges, key=lambda x: abs(x - mid_x)) if right_edges else width - 1
+                selected = [left_nearest, right_nearest]
+            eL, eR = selected[0], selected[1]
+            current_red_points = [eL, eR]
+            # 如果两条都是真实边（非虚拟0/639），做斜率匹配
+            if eL not in [0, width - 1] and eR not in [0, width - 1]:
+                edge_L_xs.append(eL)
+                edge_R_xs.append(eR)
+                edge_ys.append(y)
+                if len(edge_ys) >= SLOPE_HIST_LEN:
+                    ys = np.array(edge_ys, dtype=np.float64)
+                    xs_L = np.array(edge_L_xs, dtype=np.float64)
+                    xs_R = np.array(edge_R_xs, dtype=np.float64)
+                    slope_L = np.polyfit(ys, xs_L, 1)[0]
+                    slope_R = np.polyfit(ys, xs_R, 1)[0]
+                    if abs(slope_L - slope_R) <= SLOPE_TOLERANCE:
+                        # 匹配成功：当前帧的可靠配对
+                        frozen_half_width = abs(eL - eR) / 2.0
+                        avg_index = np.mean(selected)
+                        new_green_point = (int(avg_index), y)
+                    else:
+                        # 不匹配：置信度选边
+                        trusted = _pick_edge_by_confidence(
+                            eL, slope_L, eR, slope_R, recent_error_sign, green_points
+                        )
+                        # 转为单边模式，用冻结半宽推算虚拟边
+                        current_red_points = [trusted]
+                        sigle += 1
+                        if frozen_half_width > 0:
+                            v = trusted + frozen_half_width if trusted < width // 2 else trusted - frozen_half_width
+                        else:
+                            v = width - 1 if trusted < width // 2 else 0
+                        current_red_points.append(v)
+                        avg_index = np.mean(current_red_points)
+                        new_green_point = (int(avg_index), y)
+                else:
+                    avg_index = np.mean(selected)
+                    new_green_point = (int(avg_index), y)
+            else:
+                # 有虚拟边：窄簇（lane line pair 太近）→ 舍弃靠近中央的补虚拟边
+                if len(current_red_points) == 2:
+                    if abs(current_red_points[0] - current_red_points[1]) < width / 3:
+                        if abs(current_red_points[0] - width // 2) > abs(current_red_points[1] - width // 2):
+                            current_red_points = [current_red_points[1], width - 1 if current_red_points[1] < width // 2 else 0]
+                        else:
+                            current_red_points = [current_red_points[0], width - 1 if current_red_points[0] < width // 2 else 0]
+                    avg_index = np.mean(current_red_points)
+                    new_green_point = (int(avg_index), y)
+                else:
+                    mid_x = width // 2
+                    left_red_points = [pt for pt in current_red_points if pt < mid_x]
+                    right_red_points = [pt for pt in current_red_points if pt >= mid_x]
+                    left_nearest = min(left_red_points, key=lambda x: abs(x - mid_x)) if left_red_points else 0
+                    right_nearest = min(right_red_points, key=lambda x: abs(x - mid_x)) if right_red_points else width - 1
+                    current_red_points = [left_nearest, right_nearest]
+                    avg_index = np.mean(current_red_points)
+                    new_green_point = (int(avg_index), y)
         if current_red_points:
             current_red_points_zuixiamian = current_red_points
         for rp in current_red_points:
@@ -284,6 +343,27 @@ def find_white_pixel_indices(img):
     for x, y in red_points:
         cv2.circle(vis, (x, y), 3, (0, 0, 255), -1)
     return green_points, red_points, current_red_points_zuixiamian, vis, kanbujian
+
+
+def _pick_edge_by_confidence(eL, slope_L, eR, slope_R, recent_error_sign, green_points):
+    """两条边斜率不匹配时，根据历史转向方向选择更可信的一条。
+
+    recent_error_sign > 0 → 正在左转 → 左侧边更可信
+    recent_error_sign < 0 → 正在右转 → 右侧边更可信
+    recent_error_sign == 0 → 根据中心线趋势选斜率更匹配的边
+    """
+    if recent_error_sign > 0:
+        return eL
+    if recent_error_sign < 0:
+        return eR
+    if len(green_points) >= 5:
+        recent_ys = np.array([gp[1] for gp in green_points[-5:]], dtype=np.float64)
+        recent_xs = np.array([gp[0] for gp in green_points[-5:]], dtype=np.float64)
+        center_slope = np.polyfit(recent_ys, recent_xs, 1)[0]
+        if abs(slope_L - center_slope) < abs(slope_R - center_slope):
+            return eL
+        return eR
+    return eL
 
 
 def extract_horizontal_bands(bin_img, kernel_w=31):
@@ -349,7 +429,7 @@ def detect_stop_line(bin_img, top_ratio=STOP_LINE_ROI_TOP_RATIO, width_ratio=STO
     return bool(detected), int(lowest_y)
 
 
-def new_get_results(yuan_image, line_up_ratio=0.69, bin_img=None):
+def new_get_results(yuan_image, line_up_ratio=0.69, bin_img=None, recent_error_sign=0):
     line_low = 1.0
     if bin_img is None:
         origin_img, bin_img, mask = new_get_yellow_lane_bin_img(yuan_image, HSV_PARAMS)
@@ -364,7 +444,7 @@ def new_get_results(yuan_image, line_up_ratio=0.69, bin_img=None):
     bin_img_rectangle_ROI = cv2.dilate(bin_img_rectangle_ROI, kernel_dilate, iterations=2)
     # 剔除横向停止线带，只保留纵向车道线，避免停止线被误匹配为车道线
     bin_img_rectangle_ROI = remove_horizontal_white_bands(bin_img_rectangle_ROI)
-    green_points, red_points, current_red_points_zuixiamian, vis, kanbujian = find_white_pixel_indices(bin_img_rectangle_ROI)
+    green_points, red_points, current_red_points_zuixiamian, vis, kanbujian = find_white_pixel_indices(bin_img_rectangle_ROI, recent_error_sign)
     return green_points, red_points, bin_img_rectangle_ROI, bin_img_rectangle_ROI, current_red_points_zuixiamian, vis, kanbujian
 
 
@@ -488,6 +568,7 @@ def image_cb(msg):
 
         with state.lock:
             start_time = state.start_time
+            prev_error_sign = np.sign(state.error) if state.error != 0 else 0
         elapsed = time.time() - start_time if start_time > 0 else 9999.0
 
         # 动态 ROI 切换：默认根据用户要求设定为底部 40% (roi_up = 0.60)
@@ -502,7 +583,7 @@ def image_cb(msg):
         _, full_bin, _ = new_get_yellow_lane_bin_img(frame, HSV_PARAMS)
         stop_detected, stop_y = detect_stop_line(full_bin)
 
-        green_points, red_points, roi_1, roi_2, current_red_points_zuixiamian, vis, kanbujian = new_get_results(frame, line_up_ratio=roi_up, bin_img=full_bin)
+        green_points, red_points, roi_1, roi_2, current_red_points_zuixiamian, vis, kanbujian = new_get_results(frame, line_up_ratio=roi_up, bin_img=full_bin, recent_error_sign=prev_error_sign)
         angle_first_last, angle_first_middle, avg_last_3_x = calculate_metrics(green_points)
 
         if angle_first_middle > 0:
