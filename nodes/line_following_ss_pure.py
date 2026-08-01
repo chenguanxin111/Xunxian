@@ -60,8 +60,8 @@ CAMERA_TIMEOUT = 0.8
 
 # 停止线检测参数（外接矩形法）
 STOP_LINE_ROI_TOP_RATIO = 0.75     # 停止线检测区域限制为画面下方 25% (y 从 0.75*H 到 H)
-STOP_LINE_WIDTH_RATIO = 0.60       # 外接矩形宽度占比阈值（相对画面宽度）
-STOP_LINE_THIN_RATIO = 0.30        # 外接矩形高度/宽度比上限（保证细长）
+STOP_LINE_WIDTH_RATIO = 0.40       # 外接矩形宽度占比阈值（相对画面宽度）
+STOP_LINE_THIN_RATIO = 0.40        # 外接矩形高度/宽度比上限（保证细长）
 CREEP_SPEED = 0.10                 # 检测到停止线后的蠕动速度 (m/s)
 # 车道线斜率匹配参数
 SLOPE_TOLERANCE = 0.3          # 左右两条车道线斜率差值上限（|slope_L - slope_R| <= tolerance）
@@ -115,6 +115,8 @@ class SharedState:
         self.creep_start_x = 0.0
         self.creep_start_y = 0.0
         self.creep_angular_z = 0.0
+        # 最近角速度历史（用于进入蠕动时取平均方向，避免单帧猛打方向）
+        self.wz_history = []
 
         # odom
         self.odom_x = 0.0
@@ -668,9 +670,12 @@ def control_timer(_event):
                 state.creep_started = True
                 state.creep_start_x = state.odom_x
                 state.creep_start_y = state.odom_y
-                # 记录进入蠕动前的角速度方向，蠕动期间沿原方向前进（不摆正 90°）
-                state.creep_angular_z = state.last_v_z
-                rospy.loginfo("!!! 检测到停止线，开始蠕动 (保持原方向, wz=%.3f) !!!", state.creep_angular_z)
+                # 用最近 10 帧角速度的平均确定蠕动方向，避免单帧猛打方向
+                recent = state.wz_history[-10:]
+                avg_wz = float(np.mean(recent)) if recent else 0.0
+                state.creep_angular_z = max(-0.15, min(0.15, avg_wz))
+                rospy.loginfo("!!! 检测到停止线，开始蠕动 (平均方向 wz=%.3f, 历史 %d 帧) !!!",
+                              state.creep_angular_z, len(recent))
 
             traveled = math.hypot(state.odom_x - state.creep_start_x,
                                   state.odom_y - state.creep_start_y)
@@ -682,11 +687,11 @@ def control_timer(_event):
                 rospy.loginfo("!!! 蠕动 %.2fcm 完成，已刹停 !!!", traveled * 100)
                 return
 
-            # 蠕动：沿原方向前进（保持进入蠕动前的角速度），不摆正 90°
+            # 蠕动：沿平均方向前进（不摆正 90°），角速度限幅避免猛打
             vel_creep = Twist()
             vel_creep.linear.x = CREEP_SPEED
             vel_creep.linear.y = 0.0
-            vel_creep.angular.z = max(-0.35, min(0.35, state.creep_angular_z))
+            vel_creep.angular.z = max(-0.15, min(0.15, state.creep_angular_z))
             state.command_linear_x = vel_creep.linear.x
             state.command_linear_y = vel_creep.linear.y
             state.command_angular_z = vel_creep.angular.z
@@ -694,6 +699,11 @@ def control_timer(_event):
             return
 
         vel, pid_message = compute_pid(err, kanbujian, current_red_bottom, state)
+
+        # 记录角速度历史（保留最近 10 帧，供进入蠕动时取平均方向）
+        state.wz_history.append(float(vel.angular.z))
+        if len(state.wz_history) > 10:
+            state.wz_history = state.wz_history[-10:]
 
         state.command_linear_x = vel.linear.x
         state.command_linear_y = vel.linear.y
@@ -816,6 +826,7 @@ class Handler(BaseHTTPRequestHandler):
                 state.stop_line_hits = 0
                 state.stop_line_stopped = False
                 state.creep_started = False
+                state.wz_history = []
                 state.mode = 'RUNNING'
                 state.message = '纯巡线运行中'
                 self.reply({'ok': True})
