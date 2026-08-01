@@ -924,7 +924,18 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def reply(self, obj):
-        data = json.dumps(obj, ensure_ascii=False).encode('utf-8')
+        def default_converter(o):
+            if isinstance(o, (np.integer, np.int32, np.int64)):
+                return int(o)
+            elif isinstance(o, (np.floating, np.float32, np.float64)):
+                return float(o)
+            elif isinstance(o, np.ndarray):
+                return o.tolist()
+            elif isinstance(o, np.bool_):
+                return bool(o)
+            raise TypeError(f"Object of type {o.__class__.__name__} is not JSON serializable")
+
+        data = json.dumps(obj, default=default_converter, ensure_ascii=False).encode('utf-8')
         self.send_response(200)
         self.send_header('Content-Type', 'application/json; charset=utf-8')
         self.send_header('Content-Length', str(len(data)))

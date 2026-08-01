@@ -118,21 +118,24 @@ class SharedState:
         return {
             'mode': self.mode,
             'message': self.message,
-            'error_deg': round(self.error, 1) if self.error is not None else None,
+            'error_deg': float(round(self.error, 1)) if self.error is not None else None,
             'kanbujian': bool(self.kanbujian),
-            'center_count': len(self.centers),
-            'roi_up': self.roi_up,
-            'target_speed': self.target_speed,
-            'command_linear_x': round(self.command_linear_x, 3),
-            'command_linear_y': round(self.command_linear_y, 3),
-            'command_angular_z': round(self.command_angular_z, 3),
-            'vision_valid': self.vision_valid,
-            'lost_frames': self.lost_frames,
-            'image_age_s': round(max(0.0, time.time() - self.last_image_time), 2),
-            'stop_line_detected': self.stop_line_detected,
-            'stop_line_y': self.stop_line_y,
-            'stop_line_hits': self.stop_line_hits,
-            'stop_line_stopped': self.stop_line_stopped,
+            'center_count': int(len(self.centers)),
+            'roi_up': float(self.roi_up),
+            'target_speed': float(self.target_speed),
+            'command_linear_x': float(round(self.command_linear_x, 3)),
+            'command_linear_y': float(round(self.command_linear_y, 3)),
+            'command_angular_z': float(round(self.command_angular_z, 3)),
+            'vision_valid': bool(self.vision_valid),
+            'lost_frames': int(self.lost_frames),
+            'image_age_s': float(round(max(0.0, time.time() - self.last_image_time), 2)),
+            'stop_line_detected': bool(self.stop_line_detected),
+            'stop_line_y': int(self.stop_line_y),
+            'stop_line_hits': int(self.stop_line_hits),
+            'stop_line_stopped': bool(self.stop_line_stopped),
+            'creep_started': bool(self.creep_started),
+            'odom_x': float(round(self.odom_x, 3)),
+            'odom_y': float(round(self.odom_y, 3)),
         }
 
 
@@ -334,8 +337,8 @@ def detect_stop_line(bin_img, width_ratio=STOP_LINE_WIDTH_RATIO, thin_ratio=STOP
         if bw >= int(width * width_ratio) and bh <= bw * thin_ratio:
             detected = True
             if y + bh > lowest_y:
-                lowest_y = y + bh
-    return detected, lowest_y
+                lowest_y = int(y + bh)
+    return bool(detected), int(lowest_y)
 
 
 def new_get_results(yuan_image, line_up_ratio=0.69, bin_img=None):
@@ -660,7 +663,18 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def reply(self, obj):
-        data = json.dumps(obj, ensure_ascii=False).encode('utf-8')
+        def default_converter(o):
+            if isinstance(o, (np.integer, np.int32, np.int64)):
+                return int(o)
+            elif isinstance(o, (np.floating, np.float32, np.float64)):
+                return float(o)
+            elif isinstance(o, np.ndarray):
+                return o.tolist()
+            elif isinstance(o, np.bool_):
+                return bool(o)
+            raise TypeError(f"Object of type {o.__class__.__name__} is not JSON serializable")
+
+        data = json.dumps(obj, default=default_converter, ensure_ascii=False).encode('utf-8')
         self.send_response(200)
         self.send_header('Content-Type', 'application/json; charset=utf-8')
         self.send_header('Content-Length', str(len(data)))
