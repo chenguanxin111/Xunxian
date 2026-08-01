@@ -429,9 +429,6 @@ def image_cb(msg):
         elif msg.encoding.lower() != 'bgr8':
             frame = bridge.imgmsg_to_cv2(msg, 'bgr8')
 
-        # 水平镜像翻转 (与原版 xunxian.py / node4 一致，在图像输入端翻转)
-        frame = cv2.flip(frame, 1)
-
         with state.lock:
             start_time = state.start_time
         elapsed = time.time() - start_time if start_time > 0 else 9999.0
@@ -469,13 +466,24 @@ def image_cb(msg):
         cv2.putText(overlay, f"STOPLINE: {stop_detected} y={stop_y} (trigger {trigger_y})", (10, 75),
                     cv2.FONT_HERSHEY_SIMPLEX, .5, (0, 255, 255), 1)
 
+        # 仅显示时翻转（检测仍用未翻转图，与 ss.py 符号约定一致）；
+        # 先翻转图像再加文字，避免文字镜像。
+        overlay_disp = cv2.flip(overlay, 1)
+        mask_disp = cv2.flip(roi_1, 1)
+        cv2.putText(overlay_disp, f"MODE: {state.mode} | KANBUJIAN: {kanbujian} | ROI: {roi_up}", (10, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, .6, (0, 255, 255), 2)
+        cv2.putText(overlay_disp, f"error={error:.1f} deg  centers={len(green_points)}",
+                    (10, 50), cv2.FONT_HERSHEY_SIMPLEX, .5, (255, 255, 255), 1)
+        cv2.putText(overlay_disp, f"STOPLINE: {stop_detected} y={stop_y} (trigger {trigger_y})", (10, 75),
+                    cv2.FONT_HERSHEY_SIMPLEX, .5, (0, 255, 255), 1)
+
         with state.lock:
             state.last_image_time = time.time()
             state.roi_1 = roi_1
             state.roi_2 = roi_2
             state.vis = vis
-            state.vis_overlay = overlay
-            state.vis_mask = roi_1
+            state.vis_overlay = overlay_disp
+            state.vis_mask = mask_disp
             state.roi_up = roi_up
             state.centers = green_points
             state.red_points = red_points
@@ -493,9 +501,9 @@ def image_cb(msg):
             state.stop_line_y = stop_y
 
         if mask_pub is not None:
-            mask_pub.publish(safe_cv2_to_imgmsg(roi_1, 'mono8'))
+            mask_pub.publish(safe_cv2_to_imgmsg(mask_disp, 'mono8'))
         if overlay_pub is not None:
-            overlay_pub.publish(safe_cv2_to_imgmsg(overlay, 'bgr8'))
+            overlay_pub.publish(safe_cv2_to_imgmsg(overlay_disp, 'bgr8'))
 
     except Exception as e:
         rospy.logerr_throttle(2, f"纯巡线图像回调异常: {e}")
