@@ -16,7 +16,7 @@ import time
 import math
 import threading
 from urllib.parse import urlparse
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 import cv2
 import numpy as np
@@ -920,6 +920,9 @@ setInterval(async()=>{try{document.getElementById('status').textContent=JSON.str
 
 
 class Handler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass
+
     def reply(self, obj):
         data = json.dumps(obj, ensure_ascii=False).encode('utf-8')
         self.send_response(200)
@@ -999,7 +1002,7 @@ class Handler(BaseHTTPRequestHandler):
 import socket
 
 
-class ReusableHTTPServer(HTTPServer):
+class ReusableHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
     def server_bind(self):
