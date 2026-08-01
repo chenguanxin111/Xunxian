@@ -69,6 +69,12 @@ ALIGN_YAW_MAX_TIME = 0.6         # 微调最长耗时 (s)
 ALIGN_YAW_TOL_DEG = 1.5          # 与对准起始 yaw 偏差收敛阈值 (度)
 ALIGN_YAW_KP = 1.2               # 微调 angular.z 增益 (rad/s per rad)
 ALIGN_YAW_WZ = 0.15              # 微调角速度限幅 (rad/s)
+# ---- 最终右转 45°（刹停后原地右转）----
+RIGHT_TURN_DEG = 45.0            # 右转角度（右转 = 负 yaw）
+RIGHT_TURN_KP = 0.5              # 右转 angular.z 增益
+RIGHT_TURN_WZ = 0.20             # 右转角速度限幅 (rad/s)
+RIGHT_TURN_TOL_DEG = 2.0         # 右转到位判定 (度)
+RIGHT_TURN_TIMEOUT = 8.0         # 右转超时 (s)
 ALIGN_MAX_DISTANCE = 0.25        # 对准阶段最远前进距离
 STRAIGHT_MAX_DISTANCE = 3.0      # 直行最远距离（保护）
 STRAIGHT_TIMEOUT = 30.0
@@ -133,6 +139,7 @@ class SharedState:
         self.align_good_frames = 0
         self.align_start_yaw = None      # ALIGN 开始时的车头 yaw（LiDAR 对准的基准）
         self.yaw_pause_started = None    # ALIGN_YAW 微调阶段起始时刻
+        self.turn_start_yaw = None       # RIGHT_TURN 起始 yaw（右转 45° 的基准）
         self.straight_heading_offset = 0.0
         self.straight_history_wz = []     # 直行时视觉丢失的缓行方向
 
@@ -569,11 +576,17 @@ def control_timer(_event):
     with state.lock:
         now = time.time()
         mode = state.mode
-        if mode not in ('ALIGN', 'ALIGN_YAW', 'STRAIGHT'):
+        if mode not in ('ALIGN', 'ALIGN_YAW', 'STRAIGHT', 'RIGHT_TURN'):
             return
-        if state.odom is None or now - state.last_image_time > CAMERA_TIMEOUT:
+        if state.odom is None:
             state.mode = 'FAULT'
-            state.message = '里程计不可用或相机超时，已停车'
+            state.message = '里程计不可用，已停车'
+            publish_stop()
+            return
+        # 右转只依赖里程计，不要求相机在线
+        if mode != 'RIGHT_TURN' and now - state.last_image_time > CAMERA_TIMEOUT:
+            state.mode = 'FAULT'
+            state.message = '相机超时，已停车'
             publish_stop()
             return
 
@@ -638,10 +651,10 @@ def control_timer(_event):
             if state.stop_detected:
                 state.stop_hits += 1
                 if state.stop_hits >= STOP_CONFIRM_FRAMES:
-                    state.mode = 'STOPPED'
-                    state.message = '检测到红绿灯前白线，已刹停'
+                    state.turn_start_yaw = state.odom[2]
+                    begin_phase('RIGHT_TURN', '检测到停止线，原地右转45°')
                     publish_stop()
-                    rospy.loginfo('!!! 检测到停止线，刹停 !!!')
+                    rospy.loginfo('!!! 检测到停止线，开始右转45° !!!')
                     return
             else:
                 state.stop_hits = 0
@@ -676,6 +689,22 @@ def control_timer(_event):
             cmd.angular.z = max(-STRAIGHT_WZ_CLAMP, min(STRAIGHT_WZ_CLAMP, cmd.angular.z))
             state.control_source = 'STRAIGHT_VISION' if state.lane_valid else 'STRAIGHT_LOST'
 
+        elif mode == 'RIGHT_TURN':
+            # 刹停后原地右转 45°：只转不移动，用里程计 yaw 做目标
+            target_yaw = state.turn_start_yaw - math.radians(RIGHT_TURN_DEG)
+            yaw_err = normalize_angle(target_yaw - state.odom[2])
+            cmd.linear.x = 0.0
+            cmd.linear.y = 0.0
+            if abs(math.degrees(yaw_err)) <= RIGHT_TURN_TOL_DEG or now - state.state_started > RIGHT_TURN_TIMEOUT:
+                state.mode = 'FINISHED'
+                state.message = '右转45°完成，任务结束'
+                publish_stop()
+                rospy.loginfo('!!! 右转45°完成，任务结束 !!!')
+                return
+            cmd.angular.z = RIGHT_TURN_KP * yaw_err
+            cmd.angular.z = max(-RIGHT_TURN_WZ, min(RIGHT_TURN_WZ, cmd.angular.z))
+            state.control_source = 'RIGHT_TURN'
+
         # 记录角速度历史（直行丢失时用）
         state.straight_history_wz.append(float(cmd.angular.z))
         if len(state.straight_history_wz) > 10:
@@ -691,7 +720,7 @@ PAGE = '''<!doctype html><meta charset="utf-8"><title>直行穿路口</title>
 <style>body{font:16px sans-serif;background:#0f172a;color:#f8fafc;margin:20px}main{max-width:1100px;margin:auto}section{background:#1e293b;padding:16px;margin:12px 0;border-radius:10px}img{width:48%;background:#111;margin:1%;border-radius:6px}.start{background:#1677ff;color:white}.stop{background:#d00;color:white}button{padding:12px 22px;border:0;border-radius:6px;margin-right:10px;font-size:16px;cursor:pointer}pre{font-size:15px;background:#0f172a;padding:10px;border-radius:6px;color:#38bdf8}</style>
 <main><h2>直行穿路口 + 白线停车 (Port 5008)</h2>
 <section><b>默认不运动。确认场地清空并准备急停后再启动。</b>
-<p>流程：平移对准路口对面中线 → 短暂微调车头朝向 → 龟速直行(保持y方向≤5°) → 检测脚下白线 → 刹停。</p>
+<p>流程：平移对准路口对面中线 → 短暂微调车头朝向 → 龟速直行(保持y方向≤5°) → 检测脚下白线刹停 → 原地右转45° → 任务结束。</p>
 <p><button class="start" onclick="post('/api/start')">解锁并开始</button><button class="stop" onclick="post('/api/stop')">立即停车</button><button onclick="post('/api/reset')">复位为仅感知</button></p>
 <pre id="status">加载状态中...</pre></section>
 <section><h3>识别叠加图 (/straight_pass/debug/overlay) 与 二值图 (/straight_pass/debug/mask)</h3>
@@ -772,7 +801,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not ALLOW_MOTION:
                     self.reply({'ok': False, 'error': '动作解锁开关未开启'})
                     return
-                if state.mode not in ('DISARMED', 'FAULT', 'STOPPED'):
+                if state.mode not in ('DISARMED', 'FAULT', 'STOPPED', 'FINISHED'):
                     self.reply({'ok': False, 'error': '任务已经运行'})
                     return
                 if state.odom is None:
