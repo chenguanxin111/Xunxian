@@ -299,6 +299,7 @@ def compute_pid(error, kanbujian, current_red_points_zuixiamian, state):
         elif "中弯" in pid_message: kp_z, kp_y, kd_z = 0.026, 0.00005, 0.2
         elif "极弯" in pid_message: kp_z, kp_y, kd_z = 0.029, 0.00005, 0.1
         elif "大极弯" in pid_message: kp_z, kp_y, kd_z = 0.033, 0.00005, 0.25
+        else: kp_z, kp_y, kd_z = 0.020, 0.00005, 0.22  # 看不见：直线默认增益
     else:
         if "小直线" in pid_message: kp_z, kp_y, kd_z = 0.016, 0.00005, 0.25
         elif "小弯" in pid_message: kp_z, kp_y, kd_z = 0.022, 0.00005, 0.2
@@ -359,21 +360,19 @@ def draw_overlay(resize_img, green_points, red_points, roi_up):
 
 def image_cb(msg):
     try:
-        frame = bridge.imgmsg_to_cv2(msg, 'bgr8')
-        if msg.encoding.lower() == 'rgb8':
-            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        frame = bridge.imgmsg_to_cv2(msg, 'passthrough')
 
         with state.lock:
             start_time = state.start_time
         elapsed = time.time() - start_time if start_time > 0 else 9999.0
 
-        # 动态 ROI 切换（ss.py 主循环原版逻辑，去掉避障视野）
+        # 动态 ROI 切换：默认根据用户要求设定为底部 40% (roi_up = 0.60)
         if elapsed < GENTLE_START_DURATION:
             roi_up = 0.40
         elif elapsed < GENTLE_START_DURATION + LARGE_FOV_DURATION_AFTER_START:
             roi_up = 0.50
         else:
-            roi_up = 0.69
+            roi_up = 0.60
 
         green_points, red_points, roi_1, roi_2, current_red_points_zuixiamian, vis, kanbujian = new_get_results(frame, line_up_ratio=roi_up)
         angle_first_last, angle_first_middle, avg_last_3_x = calculate_metrics(green_points)
