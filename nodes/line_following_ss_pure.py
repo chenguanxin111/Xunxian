@@ -43,6 +43,7 @@ from cv_bridge import CvBridge
 from sensor_msgs.msg import Image
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Twist
+from tf.transformations import euler_from_quaternion
 
 # 统一分辨率（与去年 ss.py pw=640, ph=360 一致）
 pw = 640
@@ -121,6 +122,10 @@ class SharedState:
         # odom
         self.odom_x = 0.0
         self.odom_y = 0.0
+        self.odom_yaw = 0.0
+
+        # 蠕动角度限制
+        self.creep_start_yaw = 0.0
 
     def status(self):
         return {
@@ -646,6 +651,9 @@ def odom_cb(data):
     with state.lock:
         state.odom_x = data.pose.pose.position.x
         state.odom_y = data.pose.pose.position.y
+        q = data.pose.pose.orientation
+        euler = euler_from_quaternion((q.x, q.y, q.z, q.w))
+        state.odom_yaw = euler[2]
 
 
 def control_timer(_event):
@@ -670,6 +678,7 @@ def control_timer(_event):
                 state.creep_started = True
                 state.creep_start_x = state.odom_x
                 state.creep_start_y = state.odom_y
+                state.creep_start_yaw = state.odom_yaw
                 # 用最近 10 帧角速度的平均确定蠕动方向，避免单帧猛打方向
                 recent = state.wz_history[-10:]
                 avg_wz = float(np.mean(recent)) if recent else 0.0
@@ -691,7 +700,14 @@ def control_timer(_event):
             vel_creep = Twist()
             vel_creep.linear.x = CREEP_SPEED
             vel_creep.linear.y = 0.0
-            vel_creep.angular.z = max(-0.15, min(0.15, state.creep_angular_z))
+            # 累计摆角不得超过进入蠕动时车身角度的 ±5°
+            MAX_CREEP_YAW_DELTA = math.radians(5.0)
+            d_yaw = state.odom_yaw - state.creep_start_yaw
+            d_yaw = (d_yaw + math.pi) % (2 * math.pi) - math.pi  # 归一化到 [-pi, pi]
+            if abs(d_yaw) >= MAX_CREEP_YAW_DELTA:
+                vel_creep.angular.z = 0.0
+            else:
+                vel_creep.angular.z = max(-0.15, min(0.15, state.creep_angular_z))
             state.command_linear_x = vel_creep.linear.x
             state.command_linear_y = vel_creep.linear.y
             state.command_angular_z = vel_creep.angular.z
