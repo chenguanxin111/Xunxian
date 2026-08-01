@@ -136,11 +136,15 @@ def load_hsv_params():
             try:
                 with open(p, 'r') as f:
                     data = json.load(f)
-                    rospy.loginfo("纯巡线节点载入 HSV 配置文件: %s", p)
+                    rospy.loginfo("纯巡线节点成功载入 HSV 配置文件 [%s]: H=(%d,%d), S=(%d,%d), V=(%d,%d)",
+                                  p, data.get('low_h', 0), data.get('high_h', 179),
+                                  data.get('low_s', 0), data.get('high_s', 71),
+                                  data.get('low_v', 116), data.get('high_v', 255))
                     return data
             except Exception as e:
                 pass
-    return {'low_h': 0, 'high_h': 179, 'low_s': 0, 'high_s': 70, 'low_v': 100, 'high_v': 255}
+    return {'low_h': 42, 'high_h': 179, 'low_s': 5, 'high_s': 71, 'low_v': 116, 'high_v': 255,
+            'blur_ksize': 4, 'erode_iter': 0, 'erode_ksize': 3, 'dilate_iter': 2, 'dilate_ksize': 3}
 
 HSV_PARAMS = load_hsv_params()
 
@@ -148,21 +152,30 @@ HSV_PARAMS = load_hsv_params()
 def new_get_yellow_lane_bin_img(frame, params=None):
     if params is None:
         params = HSV_PARAMS
-    low_h = params.get('low_h', 0)
+    
+    blur_k = int(params.get('blur_ksize', 4))
+    if blur_k >= 3:
+        if blur_k % 2 == 0:
+            blur_k += 1
+        frame_for_hsv = cv2.GaussianBlur(frame, (blur_k, blur_k), 0)
+    else:
+        frame_for_hsv = frame
+
+    low_h = params.get('low_h', 42)
     high_h = params.get('high_h', 179)
-    low_s = params.get('low_s', 0)
-    high_s = params.get('high_s', 70)
-    low_v = params.get('low_v', 100)
+    low_s = params.get('low_s', 5)
+    high_s = params.get('high_s', 71)
+    low_v = params.get('low_v', 116)
     high_v = params.get('high_v', 255)
 
     lower_array = np.array([low_h, low_s, low_v])
     upper_array = np.array([high_h, high_s, high_v])
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    hsv = cv2.cvtColor(frame_for_hsv, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, lowerb=lower_array, upperb=upper_array)
-    _img = mask
-    small_img = cv2.resize(_img, (pw, ph), interpolation=cv2.INTER_AREA)
-    small_img = small_img.astype(np.uint8)
-    retval, bin_img = cv2.threshold(small_img, 125, 255, cv2.THRESH_BINARY)
+    
+    small_mask = cv2.resize(mask, (pw, ph), interpolation=cv2.INTER_AREA)
+    small_mask = small_mask.astype(np.uint8)
+    retval, bin_img = cv2.threshold(small_mask, 125, 255, cv2.THRESH_BINARY)
     origin_img = cv2.resize(frame, (pw, ph), interpolation=cv2.INTER_AREA)
     return origin_img, bin_img, mask
 
@@ -361,6 +374,10 @@ def draw_overlay(resize_img, green_points, red_points, roi_up):
 def image_cb(msg):
     try:
         frame = bridge.imgmsg_to_cv2(msg, 'passthrough')
+        if msg.encoding.lower() == 'rgb8':
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        elif msg.encoding.lower() != 'bgr8':
+            frame = bridge.imgmsg_to_cv2(msg, 'bgr8')
 
         with state.lock:
             start_time = state.start_time
@@ -407,16 +424,20 @@ def image_cb(msg):
             else:
                 state.lost_frames += 1
 
+        # 画面镜像翻转输出（满足显示器直观渲染要求）
+        overlay_disp = cv2.flip(overlay, 1)
+        mask_disp = cv2.flip(roi_1, 1)
+
         if mask_pub is not None:
-            mask_pub.publish(safe_cv2_to_imgmsg(roi_1, 'mono8'))
+            mask_pub.publish(safe_cv2_to_imgmsg(mask_disp, 'mono8'))
         if overlay_pub is not None:
-            overlay_pub.publish(safe_cv2_to_imgmsg(overlay, 'bgr8'))
+            overlay_pub.publish(safe_cv2_to_imgmsg(overlay_disp, 'bgr8'))
 
         # 如果开启 X11 DISPLAY 桌面显示，弹出 cv2.imshow GUI 窗口
         if os.environ.get('DISPLAY'):
             try:
-                cv2.imshow("ss_pure 纯巡线 overlay 画面", overlay)
-                cv2.imshow("ss_pure 纯巡线 mask 二值图", roi_1)
+                cv2.imshow("ss_pure 纯巡线 overlay 画面", overlay_disp)
+                cv2.imshow("ss_pure 纯巡线 mask 二值图", mask_disp)
                 cv2.waitKey(1)
             except Exception:
                 pass
