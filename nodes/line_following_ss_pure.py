@@ -526,7 +526,7 @@ def compute_pid(error, kanbujian, current_red_points_zuixiamian, state):
         kd_z *= 0.5
     else:
         vel.linear.x = state.target_speed + state.chongci
-        kp_z *= 1.22
+        kp_z *= 1.0
         kd_z *= 1.2
 
     kp_y *= 15
