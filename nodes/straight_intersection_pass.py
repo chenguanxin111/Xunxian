@@ -335,17 +335,31 @@ def build_center_guide_ipm(contours):
     return best
 
 
-def build_center_guide_pixels(mask, img_w=640, img_h=480):
+def build_center_guide_pixels(mask, contours=None, img_w=640, img_h=480):
     """像素空间行扫描中线兜底（当 IPM 无法拟合时）。
 
-    从 ROI 底部向上逐行扫描（每 8 像素），找左/右白带中心，
-    取中点作为中线点。计算 center_error（相对图像宽度一半）
-    与 heading_error_deg（近/远点连线与垂直方向的夹角）。
+    与 right_turn_trial.analyze_lanes 保持一致：
+      - 取左右两侧最大的轮廓构建 clean_mask，再逐行扫描
+      - center_error 直接由中线点计算（无纵向跨度门槛）
+      - heading 仅在纵向跨度足够时计算，否则视为 0
     """
+    if contours is None:
+        clean_mask = mask
+    else:
+        left = [c for c in contours
+                if cv2.boundingRect(c)[0] + cv2.boundingRect(c)[2] / 2 < img_w / 2]
+        right = [c for c in contours
+                 if cv2.boundingRect(c)[0] + cv2.boundingRect(c)[2] / 2 >= img_w / 2]
+        clean_mask = np.zeros_like(mask)
+        if left:
+            cv2.drawContours(clean_mask, [left[0]], -1, 255, -1)
+        if right:
+            cv2.drawContours(clean_mask, [right[0]], -1, 255, -1)
+
     roi_top = int(img_h * 0.45)
     centers_px = []
     for y in range(img_h - 1, roi_top, -8):
-        xs = np.flatnonzero(mask[y] > 0)
+        xs = np.flatnonzero(clean_mask[y] > 0)
         if len(xs) == 0:
             continue
         groups = np.split(xs, np.where(np.diff(xs) > 2)[0] + 1)
@@ -364,14 +378,15 @@ def build_center_guide_pixels(mask, img_w=640, img_h=480):
     far_count = min(5, len(centers_px))
     near_x = float(np.mean([p[0] for p in centers_px[:near_count]]))
     far_x = float(np.mean([p[0] for p in centers_px[-far_count:]]))
+    center_error = near_x - img_w / 2.0
+
     near_y = float(np.mean([p[1] for p in centers_px[:near_count]]))
     far_y = float(np.mean([p[1] for p in centers_px[-far_count:]]))
     forward_px = near_y - far_y
-    if forward_px < 30.0:
-        return None
-
-    center_error = near_x - img_w / 2.0
-    heading_deg = math.degrees(math.atan2(far_x - near_x, forward_px))
+    if forward_px >= 20.0:
+        heading_deg = math.degrees(math.atan2(far_x - near_x, forward_px))
+    else:
+        heading_deg = 0.0
 
     overlay_points = list(centers_px)
     return {
@@ -439,7 +454,7 @@ def image_cb(msg):
         guide = build_center_guide_ipm(contours)
         # 当 IPM 无法拟合时（路口对面无纵向车道线），使用像素空间行扫描兜底
         if guide is None:
-            guide = build_center_guide_pixels(mask)
+            guide = build_center_guide_pixels(mask, contours)
         stop_det, stop_y, stop_ratio = detect_stop_line_ipm(mask)
 
         with state.lock:
