@@ -12,6 +12,8 @@ import math
 import select
 import termios
 import tty
+import json
+import urllib.request
 
 import rospy
 import tf2_ros
@@ -25,8 +27,10 @@ class LocalizationDiagnosticsV7:
     def __init__(self):
         rospy.init_node('standalone_record_node', anonymous=True)
 
-        self.recording = False
-        self.manual_trigger = False
+        # 默认立即记录，避免小车已经处于 STOPPED/FAULT 时因“检测运动”条件
+        # 不成立而生成只有表头的 CSV。按 s 可暂停/恢复，按 q 退出。
+        self.recording = True
+        self.manual_trigger = True
         self.idle_start = None
         self.row_count = 0
 
@@ -53,7 +57,12 @@ class LocalizationDiagnosticsV7:
             'amcl_px', 'amcl_py', 'amcl_pyaw',
             'map2odom_x', 'map2odom_y', 'map2odom_yaw',
             'particle_count',
-            'scan_valid_pts', 'scan_near_ratio'
+            'scan_valid_pts', 'scan_near_ratio',
+            'lf_mode', 'lf_error_deg', 'lf_center_count', 'lf_kanbujian',
+            'lf_vision_valid', 'lf_lane_tracks', 'lf_pair_valid',
+            'lf_pair_slope_diff', 'lf_half_width', 'lf_half_width_samples',
+            'lf_far_turn', 'lf_far_confidence', 'lf_far_points',
+            'lf_image_age', 'wz_sign_flip_event'
         ]
         self.csv_writer.writerow(header)
         self.csv_file.flush()
@@ -74,6 +83,9 @@ class LocalizationDiagnosticsV7:
 
         self.amcl_pose = None
         self.latest_scan = None
+        self.line_status = {}
+        self.last_status_poll = 0.0
+        self.previous_cmd_wz = 0.0
 
         # TF buffer
         self.tf_buffer = tf2_ros.Buffer()
@@ -96,7 +108,7 @@ class LocalizationDiagnosticsV7:
         print("==================================================")
         print(f"[数据记录节点] 已启动！保存目录: {self.csv_path}")
         print("键盘按键控制说明:")
-        print("  's' / 'S' : 手动开始 / 暂停记录")
+        print("  's' / 'S' : 暂停 / 恢复记录")
         print("  'q' / 'Q' : 退出记录")
         print("==================================================")
 
@@ -150,8 +162,22 @@ class LocalizationDiagnosticsV7:
             if self.amcl_pose is not None:
                 return 2000
             return 0
-        except:
+        except Exception:
             return 0
+
+    def _poll_line_status(self, wall_time):
+        """轮询 Node4 Web 状态；失败时保留上一份，避免阻塞 ROS 记录。"""
+        if wall_time - self.last_status_poll < 0.045:
+            return self.line_status
+        self.last_status_poll = wall_time
+        try:
+            response = urllib.request.urlopen(
+                'http://127.0.0.1:5004/api/status', timeout=0.03
+            )
+            self.line_status = json.load(response)
+        except Exception:
+            pass
+        return self.line_status
 
     def _check_keyboard(self):
         if select.select([sys.stdin], [], [], 0) == ([sys.stdin], [], []):
@@ -274,6 +300,18 @@ class LocalizationDiagnosticsV7:
 
         pc = self._get_particle_count()
         valid_pts, near_ratio = self._get_scan_quality()
+        lf = self._poll_line_status(wall_t)
+        sign_flip = int(
+            abs(self.previous_cmd_wz) > 0.08 and abs(cvw) > 0.08
+            and self.previous_cmd_wz * cvw < 0
+        )
+        if sign_flip:
+            print("\n[巡线异常] cmd_wz 突然换向: %.3f -> %.3f, error=%s, "
+                  "pair=%s, kanbujian=%s, far=%s" % (
+                      self.previous_cmd_wz, cvw, lf.get('error_deg'),
+                      lf.get('lane_pair_valid'), lf.get('kanbujian'),
+                      lf.get('far_turn_direction')))
+        self.previous_cmd_wz = cvw
 
         row = [
             now_sec, wall_t,
@@ -291,6 +329,14 @@ class LocalizationDiagnosticsV7:
             mx, my, myaw,
             pc,
             valid_pts, near_ratio,
+            lf.get('mode', ''), lf.get('error_deg', ''),
+            lf.get('center_count', ''), int(bool(lf.get('kanbujian', False))),
+            int(bool(lf.get('vision_valid', False))),
+            lf.get('lane_track_count', ''), int(bool(lf.get('lane_pair_valid', False))),
+            lf.get('lane_pair_slope_diff', ''), lf.get('ipm_half_width', ''),
+            lf.get('ipm_half_width_samples', ''),
+            lf.get('far_turn_direction', ''), lf.get('far_turn_confidence', ''),
+            lf.get('far_turn_points', ''), lf.get('image_age_s', ''), sign_flip,
         ]
         self.csv_writer.writerow(row)
         self.row_count += 1

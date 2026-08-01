@@ -1,0 +1,18 @@
+{
+  "name": "白色巡线参数",
+  "low_h": 42,
+  "high_h": 179,
+  "low_s": 5,
+  "high_s": 71,
+  "low_v": 116,
+  "high_v": 255,
+  "roi_top": 0.45,
+  "roi_bottom": 1.0,
+  "roi_left": 0.0,
+  "roi_right": 1.0,
+  "blur_ksize": 4,
+  "erode_iter": 0,
+  "erode_ksize": 3,
+  "dilate_iter": 2,
+  "dilate_ksize": 3
+}

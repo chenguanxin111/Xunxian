@@ -8,7 +8,7 @@ rosrun web_video_server web_video_server
 cd ~/ucar26_ws
 catkin_make -DCATKIN_WHITELIST_PACKAGES="ucar_controller;ydlidar;ucar_map;ucar_nav"
 启动底盘：
-source devel/setup.bash
+source ~/ucar26_ws/devel/setup.bash
 roslaunch ucar_controller base_driver.launch
 启动键盘控制：
 source /opt/ros/noetic/setup.bash

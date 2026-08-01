@@ -122,20 +122,48 @@ def safe_cv2_to_imgmsg(cv_img, encoding="bgr8"):
         return msg
 
 
-# ------------------ 视觉感知（ss.py 原汁原味） ------------------
+CONFIG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'config')
 
-def new_get_yellow_lane_bin_img(frame, low_rh, high_rh, low_gs, high_gs, low_bv, high_bv):
-    lower_array = np.array([low_rh, low_gs, low_bv])
-    upper_array = np.array([high_rh, high_gs, high_bv])
+def load_hsv_params():
+    paths = [
+        os.path.join(CONFIG_DIR, 'white_lane.json'),
+        os.path.join(CONFIG_DIR, 'white_lane_right.json'),
+        os.path.join(CONFIG_DIR, 'hsv_params.json'),
+        os.path.join(CONFIG_DIR, 'fallback_hsv_params.json')
+    ]
+    for p in paths:
+        if os.path.exists(p):
+            try:
+                with open(p, 'r') as f:
+                    data = json.load(f)
+                    rospy.loginfo("纯巡线节点载入 HSV 配置文件: %s", p)
+                    return data
+            except Exception as e:
+                pass
+    return {'low_h': 0, 'high_h': 179, 'low_s': 0, 'high_s': 70, 'low_v': 100, 'high_v': 255}
+
+HSV_PARAMS = load_hsv_params()
+
+
+def new_get_yellow_lane_bin_img(frame, params=None):
+    if params is None:
+        params = HSV_PARAMS
+    low_h = params.get('low_h', 0)
+    high_h = params.get('high_h', 179)
+    low_s = params.get('low_s', 0)
+    high_s = params.get('high_s', 70)
+    low_v = params.get('low_v', 100)
+    high_v = params.get('high_v', 255)
+
+    lower_array = np.array([low_h, low_s, low_v])
+    upper_array = np.array([high_h, high_s, high_v])
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, lowerb=lower_array, upperb=upper_array)
     _img = mask
-    small_img = cv2.resize(_img, (pw, ph), cv2.INTER_AREA)
+    small_img = cv2.resize(_img, (pw, ph), interpolation=cv2.INTER_AREA)
     small_img = small_img.astype(np.uint8)
     retval, bin_img = cv2.threshold(small_img, 125, 255, cv2.THRESH_BINARY)
-    small_img = small_img.astype(np.float32)
-    img_3chanel = cv2.cvtColor(small_img, cv2.COLOR_GRAY2BGR)
-    origin_img = cv2.resize(frame, (pw, ph), cv2.INTER_AREA)
+    origin_img = cv2.resize(frame, (pw, ph), interpolation=cv2.INTER_AREA)
     return origin_img, bin_img, mask
 
 
@@ -209,10 +237,8 @@ def find_white_pixel_indices(img):
 
 
 def new_get_results(yuan_image, line_up_ratio=0.69):
-    line_low = 1
-    line_up_2 = 0.69
-    line_low_2 = 1
-    origin_img, bin_img, mask = new_get_yellow_lane_bin_img(yuan_image, 0, 120, 0, 65, 80, 255)
+    line_low = 1.0
+    origin_img, bin_img, mask = new_get_yellow_lane_bin_img(yuan_image, HSV_PARAMS)
     H = origin_img.shape[0]
     W = origin_img.shape[1]
     bin_img_rectangle_ROI = bin_img[int(H * line_up_ratio):int(H * line_low), :]
@@ -220,10 +246,8 @@ def new_get_results(yuan_image, line_up_ratio=0.69):
     kernel_dilate = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
     bin_img_rectangle_ROI = cv2.erode(bin_img_rectangle_ROI, kernel_erode, iterations=1)
     bin_img_rectangle_ROI = cv2.dilate(bin_img_rectangle_ROI, kernel_dilate, iterations=2)
-    H2 = bin_img_rectangle_ROI.shape[0]
-    bin_img_rectangle_ROI_2 = bin_img_rectangle_ROI[int(H2 * line_up_2):int(H2 * line_low_2), :]
-    green_points, red_points, current_red_points_zuixiamian, vis, kanbujian = find_white_pixel_indices(bin_img_rectangle_ROI_2)
-    return green_points, red_points, bin_img_rectangle_ROI, bin_img_rectangle_ROI_2, current_red_points_zuixiamian, vis, kanbujian
+    green_points, red_points, current_red_points_zuixiamian, vis, kanbujian = find_white_pixel_indices(bin_img_rectangle_ROI)
+    return green_points, red_points, bin_img_rectangle_ROI, bin_img_rectangle_ROI, current_red_points_zuixiamian, vis, kanbujian
 
 
 def calculate_metrics(green_points):
@@ -318,19 +342,17 @@ def compute_pid(error, kanbujian, current_red_points_zuixiamian, state):
 # ------------------ 可视化辅助 ------------------
 
 def draw_overlay(resize_img, green_points, red_points, roi_up):
-    """将 ROI_2 中的绿/红点映射回 640x360 全图并叠加显示"""
+    """将 ROI 中的绿/红点映射回 640x360 全图并叠加显示"""
     overlay = resize_img.copy()
     H = ph
-    roi_1_start_y = int(H * roi_up)
-    roi_1_h = H - roi_1_start_y
-    roi_2_start_y = roi_1_start_y + int(roi_1_h * 0.69)
+    roi_start_y = int(H * roi_up)
 
     for x, y in red_points:
-        cv2.circle(overlay, (x, y + roi_2_start_y), 2, (0, 0, 255), -1)
+        cv2.circle(overlay, (x, y + roi_start_y), 2, (0, 0, 255), -1)
     for x, y in green_points:
-        cv2.circle(overlay, (x, y + roi_2_start_y), 3, (0, 255, 0), -1)
+        cv2.circle(overlay, (x, y + roi_start_y), 3, (0, 255, 0), -1)
     if len(green_points) > 1:
-        pts = np.array([(x, y + roi_2_start_y) for x, y in green_points], np.int32)
+        pts = np.array([(x, y + roi_start_y) for x, y in green_points], np.int32)
         cv2.polylines(overlay, [pts], False, (0, 255, 0), 3)
     return overlay
 
@@ -390,6 +412,15 @@ def image_cb(msg):
             mask_pub.publish(safe_cv2_to_imgmsg(roi_1, 'mono8'))
         if overlay_pub is not None:
             overlay_pub.publish(safe_cv2_to_imgmsg(overlay, 'bgr8'))
+
+        # 如果开启 X11 DISPLAY 桌面显示，弹出 cv2.imshow GUI 窗口
+        if os.environ.get('DISPLAY'):
+            try:
+                cv2.imshow("ss_pure 纯巡线 overlay 画面", overlay)
+                cv2.imshow("ss_pure 纯巡线 mask 二值图", roi_1)
+                cv2.waitKey(1)
+            except Exception:
+                pass
 
     except Exception as e:
         rospy.logerr_throttle(2, f"纯巡线图像回调异常: {e}")
