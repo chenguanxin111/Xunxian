@@ -22,6 +22,13 @@ line_following_ss_pure.py
 
 import os
 import sys
+
+# 彻底屏蔽 Qt xcb 桌面显示器连接，防止在 SSH 环境下触发 Qt qFatal (SIGABRT) 终止程序
+os.environ["QT_QPA_PLATFORM"] = "offscreen"
+os.environ["OPENCV_UI_BACKEND"] = "HEADLESS"
+if "DISPLAY" in os.environ:
+    del os.environ["DISPLAY"]
+
 import json
 import time
 import math
@@ -486,15 +493,6 @@ def image_cb(msg):
             mask_pub.publish(safe_cv2_to_imgmsg(mask_disp, 'mono8'))
         if overlay_pub is not None:
             overlay_pub.publish(safe_cv2_to_imgmsg(overlay_disp, 'bgr8'))
-
-        # 如果开启 X11 DISPLAY 桌面显示，弹出 cv2.imshow GUI 窗口
-        if os.environ.get('DISPLAY'):
-            try:
-                cv2.imshow("ss_pure 纯巡线 overlay 画面", overlay_disp)
-                cv2.imshow("ss_pure 纯巡线 mask 二值图", mask_disp)
-                cv2.waitKey(1)
-            except Exception:
-                pass
 
     except Exception as e:
         rospy.logerr_throttle(2, f"纯巡线图像回调异常: {e}")
