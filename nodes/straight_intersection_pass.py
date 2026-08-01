@@ -154,6 +154,7 @@ class SharedState:
         self.control_source = 'STOPPED'
         self.vis_overlay = None
         self.vis_mask = None
+        self.vis_ipm = None
 
     def status(self):
         return {
@@ -453,6 +454,7 @@ def image_cb(msg):
             frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         elif msg.encoding.lower() != 'bgr8':
             frame = bridge.imgmsg_to_cv2(msg, 'bgr8')
+        raw_frame = frame.copy()          # 翻转前原始相机帧（用于 IPM 鸟瞰）
         frame = cv2.flip(frame, 1)
 
         with state.lock:
@@ -486,6 +488,24 @@ def image_cb(msg):
             state.stop_detected = stop_det
             state.stop_y_ipm = stop_y
             state.stop_width_ratio = stop_ratio
+
+        # 实时 IPM 鸟瞰图（原始相机帧经透视变换，供观察路口/入口几何）
+        if IPM_MATRIX is not None:
+            bird = cv2.warpPerspective(raw_frame, IPM_MATRIX, (600, 600))
+            cv2.rectangle(bird, (100, 0), (500, 600), (0, 255, 0), 1)
+            cv2.line(bird, (300, 0), (300, 600), (0, 0, 255), 1)
+            cv2.putText(bird, 'IPM X=100..500 lane, Y=600 feet', (8, 590),
+                        cv2.FONT_HERSHEY_SIMPLEX, .4, (0, 255, 255), 1)
+            if guide is not None and guide.get('source') != 'pixel_fallback' and 'k' in guide:
+                y_vals = np.linspace(guide.get('y_min', 40.0), guide['y_max'], 20)
+                ipm_line = np.float32([[guide['k'] * y + guide['b'], y] for y in y_vals]).reshape(-1, 1, 2)
+                bird_pts = ipm_line.reshape(-1, 2).astype(int)
+                for i in range(len(bird_pts) - 1):
+                    cv2.line(bird, tuple(bird_pts[i]), tuple(bird_pts[i + 1]), (0, 255, 0), 2)
+        else:
+            bird = None
+        with state.lock:
+            state.vis_ipm = bird
 
         overlay = frame.copy()
         cv2.rectangle(overlay, (roi[0], roi[1]), (roi[2] - 1, roi[3] - 1), (255, 120, 0), 2)
@@ -717,7 +737,7 @@ def control_timer(_event):
 
 
 PAGE = '''<!doctype html><meta charset="utf-8"><title>直行穿路口</title>
-<style>body{font:16px sans-serif;background:#0f172a;color:#f8fafc;margin:20px}main{max-width:1100px;margin:auto}section{background:#1e293b;padding:16px;margin:12px 0;border-radius:10px}img{width:48%;background:#111;margin:1%;border-radius:6px}.start{background:#1677ff;color:white}.stop{background:#d00;color:white}button{padding:12px 22px;border:0;border-radius:6px;margin-right:10px;font-size:16px;cursor:pointer}pre{font-size:15px;background:#0f172a;padding:10px;border-radius:6px;color:#38bdf8}</style>
+<style>body{font:16px sans-serif;background:#0f172a;color:#f8fafc;margin:20px}main{max-width:1100px;margin:auto}section{background:#1e293b;padding:16px;margin:12px 0;border-radius:10px}img{width:48%;background:#111;margin:1%;border-radius:6px}#img_ipm{width:60%;display:block}.start{background:#1677ff;color:white}.stop{background:#d00;color:white}button{padding:12px 22px;border:0;border-radius:6px;margin-right:10px;font-size:16px;cursor:pointer}pre{font-size:15px;background:#0f172a;padding:10px;border-radius:6px;color:#38bdf8}</style>
 <main><h2>直行穿路口 + 白线停车 (Port 5008)</h2>
 <section><b>默认不运动。确认场地清空并准备急停后再启动。</b>
 <p>流程：平移对准路口对面中线 → 短暂微调车头朝向 → 龟速直行(保持y方向≤5°) → 检测脚下白线刹停 → 原地右转45° → 任务结束。</p>
@@ -725,10 +745,14 @@ PAGE = '''<!doctype html><meta charset="utf-8"><title>直行穿路口</title>
 <pre id="status">加载状态中...</pre></section>
 <section><h3>识别叠加图 (/straight_pass/debug/overlay) 与 二值图 (/straight_pass/debug/mask)</h3>
 <img id="img_overlay"><img id="img_mask">
+</section>
+<section><h3>IPM 鸟瞰图（绿框=车道 X100~500，红竖线=中线 X300，Y600=脚下）</h3>
+<img id="img_ipm">
 </section></main>
 <script>
 document.getElementById('img_overlay').src = '/stream/overlay';
 document.getElementById('img_mask').src = '/stream/mask';
+document.getElementById('img_ipm').src = '/stream/ipm';
 async function post(p){
     try {
         let res = await (await fetch(p,{method:'POST'})).json();
@@ -773,13 +797,18 @@ class Handler(BaseHTTPRequestHandler):
         elif path == '/api/status':
             with state.lock:
                 self.reply(state.status())
-        elif path in ['/stream/overlay', '/stream/mask']:
+        elif path in ['/stream/overlay', '/stream/mask', '/stream/ipm']:
             self.send_response(200)
             self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=frame')
             self.end_headers()
             while not rospy.is_shutdown():
                 with state.lock:
-                    img = state.vis_overlay if path == '/stream/overlay' else state.vis_mask
+                    if path == '/stream/overlay':
+                        img = state.vis_overlay
+                    elif path == '/stream/mask':
+                        img = state.vis_mask
+                    else:
+                        img = state.vis_ipm
                 if img is not None:
                     ret, jpeg = cv2.imencode('.jpg', img)
                     if ret:
