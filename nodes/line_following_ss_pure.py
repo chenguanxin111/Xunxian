@@ -60,9 +60,9 @@ CAMERA_TIMEOUT = 0.8
 
 # 停止线检测参数（外接矩形法）
 STOP_LINE_ROI_TOP_RATIO = 0.75     # 停止线检测区域限制为画面下方 25% (y 从 0.75*H 到 H)
-STOP_LINE_WIDTH_RATIO = 0.70       # 外接矩形宽度占比阈值（相对画面宽度）
+STOP_LINE_WIDTH_RATIO = 0.60       # 外接矩形宽度占比阈值（相对画面宽度）
 STOP_LINE_THIN_RATIO = 0.30        # 外接矩形高度/宽度比上限（保证细长）
-CREEP_SPEED = 0.12                 # 检测到停止线后的蠕动速度 (m/s)
+CREEP_SPEED = 0.10                 # 检测到停止线后的蠕动速度 (m/s)
 # 车道线斜率匹配参数
 SLOPE_TOLERANCE = 0.3          # 左右两条车道线斜率差值上限（|slope_L - slope_R| <= tolerance）
 SLOPE_HIST_LEN = 4             # 用于计算每条边斜率的最小历史行数
@@ -114,6 +114,7 @@ class SharedState:
         self.creep_started = False
         self.creep_start_x = 0.0
         self.creep_start_y = 0.0
+        self.creep_angular_z = 0.0
 
         # odom
         self.odom_x = 0.0
@@ -667,7 +668,9 @@ def control_timer(_event):
                 state.creep_started = True
                 state.creep_start_x = state.odom_x
                 state.creep_start_y = state.odom_y
-                rospy.loginfo("!!! 检测到停止线，开始蠕动 !!!")
+                # 记录进入蠕动前的角速度方向，蠕动期间沿原方向前进（不摆正 90°）
+                state.creep_angular_z = state.last_v_z
+                rospy.loginfo("!!! 检测到停止线，开始蠕动 (保持原方向, wz=%.3f) !!!", state.creep_angular_z)
 
             traveled = math.hypot(state.odom_x - state.creep_start_x,
                                   state.odom_y - state.creep_start_y)
@@ -679,11 +682,11 @@ def control_timer(_event):
                 rospy.loginfo("!!! 蠕动 %.2fcm 完成，已刹停 !!!", traveled * 100)
                 return
 
-            # 蠕动：保持直线低速前进，不转向
+            # 蠕动：沿原方向前进（保持进入蠕动前的角速度），不摆正 90°
             vel_creep = Twist()
             vel_creep.linear.x = CREEP_SPEED
             vel_creep.linear.y = 0.0
-            vel_creep.angular.z = 0.0
+            vel_creep.angular.z = max(-0.35, min(0.35, state.creep_angular_z))
             state.command_linear_x = vel_creep.linear.x
             state.command_linear_y = vel_creep.linear.y
             state.command_angular_z = vel_creep.angular.z
