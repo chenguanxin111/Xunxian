@@ -230,7 +230,6 @@ def find_white_pixel_indices(img, recent_error_sign=0):
     kanbujian = 0
     # 斜率匹配：双边追踪
     edge_L_xs, edge_R_xs, edge_ys = [], [], []
-    frozen_half_width = 0  # 最近一次通过斜率匹配确认的"半车道宽"
     for y in range(height - 1, -1, -4):
         white_indices = np.where(img[y] == 255)[0]
         if len(white_indices) == 0:
@@ -245,12 +244,8 @@ def find_white_pixel_indices(img, recent_error_sign=0):
             sigle += 1
             red_x = int(mean_indices[0])
             current_red_points.append(red_x)
-            # 单边：优先用冻结半宽补对面边（比补到0/639更合理）
-            if len(green_points) > 1 and frozen_half_width > 0:
-                last_green_x = green_points[-1][0]
-                virtual_red_x = red_x + frozen_half_width if red_x < last_green_x else red_x - frozen_half_width
-                virtual_red_x = max(0, min(width - 1, int(virtual_red_x)))
-            elif len(green_points) > 1:
+            # 单边：沿用老代码逻辑（按中心点趋势补虚拟边到 0/639）
+            if len(green_points) > 1:
                 last_green_x = green_points[-1][0]
                 second_last_green_x = green_points[-2][0]
                 virtual_red_x = 0 if last_green_x < second_last_green_x else width - 1
@@ -287,7 +282,6 @@ def find_white_pixel_indices(img, recent_error_sign=0):
                     slope_R = np.polyfit(ys, xs_R, 1)[0]
                     if abs(slope_L - slope_R) <= SLOPE_TOLERANCE:
                         # 匹配成功：当前帧的可靠配对
-                        frozen_half_width = abs(eL - eR) / 2.0
                         avg_index = np.mean(selected)
                         new_green_point = (int(avg_index), y)
                     else:
@@ -295,13 +289,10 @@ def find_white_pixel_indices(img, recent_error_sign=0):
                         trusted = _pick_edge_by_confidence(
                             eL, slope_L, eR, slope_R, recent_error_sign, green_points
                         )
-                        # 转为单边模式，用冻结半宽推算虚拟边
+                        # 转为单边模式，按老代码逻辑补虚拟边（0/639）
                         current_red_points = [trusted]
                         sigle += 1
-                        if frozen_half_width > 0:
-                            v = trusted + frozen_half_width if trusted < width // 2 else trusted - frozen_half_width
-                        else:
-                            v = width - 1 if trusted < width // 2 else 0
+                        v = width - 1 if trusted < width // 2 else 0
                         current_red_points.append(v)
                         avg_index = np.mean(current_red_points)
                         new_green_point = (int(avg_index), y)
@@ -567,17 +558,10 @@ def image_cb(msg):
             frame = bridge.imgmsg_to_cv2(msg, 'bgr8')
 
         with state.lock:
-            start_time = state.start_time
             prev_error_sign = np.sign(state.error) if state.error != 0 else 0
-        elapsed = time.time() - start_time if start_time > 0 else 9999.0
 
-        # 动态 ROI 切换：默认根据用户要求设定为底部 40% (roi_up = 0.60)
-        if elapsed < GENTLE_START_DURATION:
-            roi_up = 0.40
-        elif elapsed < GENTLE_START_DURATION + LARGE_FOV_DURATION_AFTER_START:
-            roi_up = 0.50
-        else:
-            roi_up = 0.60
+        # 车道线检测 ROI：固定取画面下方 40% (line_up_ratio = 0.60)
+        roi_up = 0.60
 
         # 停止线检测（基于全画面二值图）
         _, full_bin, _ = new_get_yellow_lane_bin_img(frame, HSV_PARAMS)
