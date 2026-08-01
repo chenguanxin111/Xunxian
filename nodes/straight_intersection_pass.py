@@ -61,7 +61,14 @@ ALIGN_CONFIRM_FRAMES = 10        # 对准连续确认帧数
 CENTER_KP_Y = -0.0012            # 平移对准 linear.y 增益 (IPM 像素 -> m/s)
 HEADING_KP_Z = -0.008            # 直行 heading 修正 angular.z 增益 (角度->rad/s)
 CENTER_KP_Z_ALIGN = -0.0009      # 对准阶段 center_error 对 angular.z 的耦合（小）
+STRAIGHT_KP_Z = -0.0016          # 直行 center_error 对 angular.z 的增益（比对准耦合略大）
 WZ_CLAMP = 0.10                  # 直行/对准角速度限幅
+STRAIGHT_WZ_CLAMP = 0.12         # 直行角速度限幅（略放宽，增强纠偏响应）
+# ---- 对准完成后的短暂 yaw 微调 ----
+ALIGN_YAW_MAX_TIME = 0.6         # 微调最长耗时 (s)
+ALIGN_YAW_TOL_DEG = 1.5          # 与对准起始 yaw 偏差收敛阈值 (度)
+ALIGN_YAW_KP = 1.2               # 微调 angular.z 增益 (rad/s per rad)
+ALIGN_YAW_WZ = 0.15              # 微调角速度限幅 (rad/s)
 ALIGN_MAX_DISTANCE = 0.25        # 对准阶段最远前进距离
 STRAIGHT_MAX_DISTANCE = 3.0      # 直行最远距离（保护）
 STRAIGHT_TIMEOUT = 30.0
@@ -124,6 +131,8 @@ class SharedState:
         self.dual_lane_valid = False
         self.last_center_error = 0.0
         self.align_good_frames = 0
+        self.align_start_yaw = None      # ALIGN 开始时的车头 yaw（LiDAR 对准的基准）
+        self.yaw_pause_started = None    # ALIGN_YAW 微调阶段起始时刻
         self.straight_heading_offset = 0.0
         self.straight_history_wz = []     # 直行时视觉丢失的缓行方向
 
@@ -550,13 +559,17 @@ def begin_phase(mode, message):
     state.state_started = time.time()
     state.phase_start_pose = state.odom
     state.phase_distance = 0.0
+    if mode == 'ALIGN' and state.odom is not None:
+        # 记录对准起始 yaw：这是 LiDAR 对准红绿灯后的基准朝向，
+        # 供 ALIGN_YAW 微调阶段把被对准耦合带偏的车头转回来。
+        state.align_start_yaw = state.odom[2]
 
 
 def control_timer(_event):
     with state.lock:
         now = time.time()
         mode = state.mode
-        if mode not in ('ALIGN', 'STRAIGHT'):
+        if mode not in ('ALIGN', 'ALIGN_YAW', 'STRAIGHT'):
             return
         if state.odom is None or now - state.last_image_time > CAMERA_TIMEOUT:
             state.mode = 'FAULT'
@@ -587,9 +600,13 @@ def control_timer(_event):
             if abs(center_error) <= ALIGN_CENTER_TOL_PX and abs(heading_error or 0) <= 10.0:
                 state.align_good_frames += 1
                 if state.align_good_frames >= ALIGN_CONFIRM_FRAMES:
-                    state.straight_heading_offset = state.odom[2]
-                    begin_phase('STRAIGHT', '对准完成，开始龟速直行')
-                    rospy.loginfo('!!! 平移对准完成，进入直行 !!!')
+                    # 对准完成：先短暂原地微调 yaw（转回 LiDAR 基准朝向），再直行
+                    if state.align_start_yaw is None:
+                        state.align_start_yaw = state.odom[2]
+                    state.mode = 'ALIGN_YAW'
+                    state.message = '对准完成，微调车头朝向'
+                    state.yaw_pause_started = time.time()
+                    rospy.loginfo('!!! 平移对准完成，进入 yaw 微调 !!!')
                     return
             else:
                 state.align_good_frames = 0
@@ -599,6 +616,22 @@ def control_timer(_event):
             cmd.angular.z = CENTER_KP_Z_ALIGN * center_error
             cmd.angular.z = max(-WZ_CLAMP, min(WZ_CLAMP, cmd.angular.z))
             state.control_source = 'ALIGN_TRANSLATE'
+
+        elif mode == 'ALIGN_YAW':
+            # 短暂原地微调：只转不移动，把车头转回 ALIGN 起始（LiDAR 基准）朝向
+            elapsed = now - (state.yaw_pause_started or now)
+            yaw_error = normalize_angle(state.align_start_yaw - state.odom[2])
+            cmd.linear.x = 0.0
+            cmd.linear.y = 0.0
+            if abs(math.degrees(yaw_error)) <= ALIGN_YAW_TOL_DEG or elapsed > ALIGN_YAW_MAX_TIME:
+                state.straight_heading_offset = state.odom[2]
+                begin_phase('STRAIGHT', '微调完成，开始龟速直行')
+                rospy.loginfo('!!! yaw 微调完成，进入直行 (yaw_err=%.1f deg) !!!',
+                              math.degrees(yaw_error))
+                return
+            cmd.angular.z = ALIGN_YAW_KP * yaw_error
+            cmd.angular.z = max(-ALIGN_YAW_WZ, min(ALIGN_YAW_WZ, cmd.angular.z))
+            state.control_source = 'ALIGN_YAW'
 
         elif mode == 'STRAIGHT':
             # 停止线检测：IPM 脚下横向白带
@@ -624,12 +657,12 @@ def control_timer(_event):
             cmd.linear.x = STRAIGHT_SPEED
 
             if state.lane_valid:
-                # 中线可见：heading 修正优先（小），中线指向相悖则只修 heading
+                # 中线可见：用中心误差驱动转向（增益比对准耦合略大，纠偏响应更强）
                 heading_error = state.heading_error_deg if state.heading_error_deg is not None else 0.0
                 center_error = state.center_error if state.center_error is not None else 0.0
                 # 若中线指向与当前前进方向相反，仅保持原 heading，等中线更新
                 if abs(yaw_offset) <= math.radians(HEADING_TOL_DEG):
-                    cmd.angular.z = CENTER_KP_Z_ALIGN * center_error
+                    cmd.angular.z = STRAIGHT_KP_Z * center_error
                 else:
                     cmd.angular.z = 0.0
                 # 对准完成后关闭横移：直行只走 y 方向，不再横向漂移
@@ -640,7 +673,7 @@ def control_timer(_event):
                 avg_wz = float(np.mean(recent)) if recent else 0.0
                 cmd.angular.z = max(-0.06, min(0.06, avg_wz))
                 cmd.linear.y = 0.0
-            cmd.angular.z = max(-WZ_CLAMP, min(WZ_CLAMP, cmd.angular.z))
+            cmd.angular.z = max(-STRAIGHT_WZ_CLAMP, min(STRAIGHT_WZ_CLAMP, cmd.angular.z))
             state.control_source = 'STRAIGHT_VISION' if state.lane_valid else 'STRAIGHT_LOST'
 
         # 记录角速度历史（直行丢失时用）
@@ -658,7 +691,7 @@ PAGE = '''<!doctype html><meta charset="utf-8"><title>直行穿路口</title>
 <style>body{font:16px sans-serif;background:#0f172a;color:#f8fafc;margin:20px}main{max-width:1100px;margin:auto}section{background:#1e293b;padding:16px;margin:12px 0;border-radius:10px}img{width:48%;background:#111;margin:1%;border-radius:6px}.start{background:#1677ff;color:white}.stop{background:#d00;color:white}button{padding:12px 22px;border:0;border-radius:6px;margin-right:10px;font-size:16px;cursor:pointer}pre{font-size:15px;background:#0f172a;padding:10px;border-radius:6px;color:#38bdf8}</style>
 <main><h2>直行穿路口 + 白线停车 (Port 5008)</h2>
 <section><b>默认不运动。确认场地清空并准备急停后再启动。</b>
-<p>流程：平移对准路口对面中线 → 龟速直行(保持y方向≤5°) → 检测脚下白线 → 刹停。</p>
+<p>流程：平移对准路口对面中线 → 短暂微调车头朝向 → 龟速直行(保持y方向≤5°) → 检测脚下白线 → 刹停。</p>
 <p><button class="start" onclick="post('/api/start')">解锁并开始</button><button class="stop" onclick="post('/api/stop')">立即停车</button><button onclick="post('/api/reset')">复位为仅感知</button></p>
 <pre id="status">加载状态中...</pre></section>
 <section><h3>识别叠加图 (/straight_pass/debug/overlay) 与 二值图 (/straight_pass/debug/mask)</h3>
