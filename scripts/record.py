@@ -62,6 +62,7 @@ class LocalizationDiagnosticsV7:
             'lf_vision_valid', 'lf_lane_tracks', 'lf_pair_valid',
             'lf_pair_slope_diff', 'lf_half_width', 'lf_half_width_samples',
             'lf_far_turn', 'lf_far_confidence', 'lf_far_points',
+            'lf_stop_line_detected', 'lf_stop_line_y', 'lf_creep_started', 'lf_stop_line_stopped',
             'lf_image_age', 'wz_sign_flip_event'
         ]
         self.csv_writer.writerow(header)
@@ -86,6 +87,9 @@ class LocalizationDiagnosticsV7:
         self.line_status = {}
         self.last_status_poll = 0.0
         self.previous_cmd_wz = 0.0
+        self.prev_stop_line = False
+        self.prev_creep_started = False
+        self.prev_mode = ''
 
         # TF buffer
         self.tf_buffer = tf2_ros.Buffer()
@@ -166,17 +170,19 @@ class LocalizationDiagnosticsV7:
             return 0
 
     def _poll_line_status(self, wall_time):
-        """轮询 Node4 Web 状态；失败时保留上一份，避免阻塞 ROS 记录。"""
+        """轮询巡线 Web 状态；优先 5007 端口 (ss_pure)，备用 5004 端口 (node4)。"""
         if wall_time - self.last_status_poll < 0.045:
             return self.line_status
         self.last_status_poll = wall_time
-        try:
-            response = urllib.request.urlopen(
-                'http://127.0.0.1:5004/api/status', timeout=0.03
-            )
-            self.line_status = json.load(response)
-        except Exception:
-            pass
+        for port in [5007, 5004]:
+            try:
+                response = urllib.request.urlopen(
+                    f'http://127.0.0.1:{port}/api/status', timeout=0.03
+                )
+                self.line_status = json.load(response)
+                break
+            except Exception:
+                pass
         return self.line_status
 
     def _check_keyboard(self):
@@ -301,16 +307,35 @@ class LocalizationDiagnosticsV7:
         pc = self._get_particle_count()
         valid_pts, near_ratio = self._get_scan_quality()
         lf = self._poll_line_status(wall_t)
+
+        stop_line = bool(lf.get('stop_line_detected', False))
+        stop_y = lf.get('stop_line_y', -1)
+        creep = bool(lf.get('creep_started', False))
+        stop_stopped = bool(lf.get('stop_line_stopped', False))
+        mode = lf.get('mode', '')
+        msg = lf.get('message', '')
+
+        # ------------------ 关键节点喊一声 (大声输出日志) ------------------
+        if stop_line and not self.prev_stop_line:
+            print(f"\n🚨 [!!! 发现停止线 !!!] y={stop_y}px | cmd_vx={cvx:.2f} cmd_wz={cvw:.3f} | odom=({wpx:.3f}, {wpy:.3f})")
+        if creep and not self.prev_creep_started:
+            print(f"\n🚗 [!!! 进入停止线蠕动阶段 !!!] cmd_vx={cvx:.2f} cmd_wz={cvw:.3f} | odom=({wpx:.3f}, {wpy:.3f}) | msg='{msg}'")
+        if mode and mode != self.prev_mode and self.prev_mode != '':
+            print(f"\n📌 [状态切换] {self.prev_mode} -> {mode} | msg='{msg}'")
+
+        self.prev_stop_line = stop_line
+        self.prev_creep_started = creep
+        self.prev_mode = mode
+
+        # 角速度换向/摆头监测
         sign_flip = int(
-            abs(self.previous_cmd_wz) > 0.08 and abs(cvw) > 0.08
+            abs(self.previous_cmd_wz) > 0.05 and abs(cvw) > 0.05
             and self.previous_cmd_wz * cvw < 0
         )
         if sign_flip:
-            print("\n[巡线异常] cmd_wz 突然换向: %.3f -> %.3f, error=%s, "
-                  "pair=%s, kanbujian=%s, far=%s" % (
-                      self.previous_cmd_wz, cvw, lf.get('error_deg'),
-                      lf.get('lane_pair_valid'), lf.get('kanbujian'),
-                      lf.get('far_turn_direction')))
+            stage_str = "【蠕动阶段摆头摇晃】" if creep else "【巡线角速度换向】"
+            print(f"\n⚠️ {stage_str} cmd_wz 突变: {self.previous_cmd_wz:.3f} -> {cvw:.3f} | "
+                  f"error={lf.get('error_deg')} | stop_line={stop_line} (y={stop_y})")
         self.previous_cmd_wz = cvw
 
         row = [
@@ -336,7 +361,9 @@ class LocalizationDiagnosticsV7:
             lf.get('lane_pair_slope_diff', ''), lf.get('ipm_half_width', ''),
             lf.get('ipm_half_width_samples', ''),
             lf.get('far_turn_direction', ''), lf.get('far_turn_confidence', ''),
-            lf.get('far_turn_points', ''), lf.get('image_age_s', ''), sign_flip,
+            lf.get('far_turn_points', ''),
+            int(stop_line), stop_y, int(creep), int(stop_stopped),
+            lf.get('image_age_s', ''), sign_flip,
         ]
         self.csv_writer.writerow(row)
         self.row_count += 1
