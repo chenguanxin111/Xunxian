@@ -335,6 +335,54 @@ def build_center_guide_ipm(contours):
     return best
 
 
+def build_center_guide_pixels(mask, img_w=640, img_h=480):
+    """像素空间行扫描中线兜底（当 IPM 无法拟合时）。
+
+    从 ROI 底部向上逐行扫描（每 8 像素），找左/右白带中心，
+    取中点作为中线点。计算 center_error（相对图像宽度一半）
+    与 heading_error_deg（近/远点连线与垂直方向的夹角）。
+    """
+    roi_top = int(img_h * 0.45)
+    centers_px = []
+    for y in range(img_h - 1, roi_top, -8):
+        xs = np.flatnonzero(mask[y] > 0)
+        if len(xs) == 0:
+            continue
+        groups = np.split(xs, np.where(np.diff(xs) > 2)[0] + 1)
+        means = [int(np.mean(g)) for g in groups if len(g) >= 2]
+        left_x = max((x for x in means if x < img_w // 2), default=None)
+        right_x = min((x for x in means if x >= img_w // 2), default=None)
+        if left_x is not None and right_x is not None and 100 < right_x - left_x < img_w * 0.9:
+            cand_x = int((left_x + right_x) / 2)
+            if len(centers_px) == 0 or abs(cand_x - centers_px[-1][0]) < 40:
+                centers_px.append((cand_x, y))
+
+    if len(centers_px) < 3:
+        return None
+
+    near_count = min(5, len(centers_px))
+    far_count = min(5, len(centers_px))
+    near_x = float(np.mean([p[0] for p in centers_px[:near_count]]))
+    far_x = float(np.mean([p[0] for p in centers_px[-far_count:]]))
+    near_y = float(np.mean([p[1] for p in centers_px[:near_count]]))
+    far_y = float(np.mean([p[1] for p in centers_px[-far_count:]]))
+    forward_px = near_y - far_y
+    if forward_px < 30.0:
+        return None
+
+    center_error = near_x - img_w / 2.0
+    heading_deg = math.degrees(math.atan2(far_x - near_x, forward_px))
+
+    overlay_points = list(centers_px)
+    return {
+        'center_error': center_error,
+        'heading_error_deg': heading_deg,
+        'overlay_points': overlay_points,
+        'pixel_centers': centers_px,
+        'source': 'pixel_fallback',
+    }
+
+
 def detect_stop_line_ipm(bin_img_full, roi_y_top=STOP_ROI_Y_TOP):
     """在 IPM 空间检测脚下横向白带（停止线）。
 
@@ -389,6 +437,9 @@ def image_cb(msg):
         contours.sort(key=lambda c: cv2.contourArea(c), reverse=True)
 
         guide = build_center_guide_ipm(contours)
+        # 当 IPM 无法拟合时（路口对面无纵向车道线），使用像素空间行扫描兜底
+        if guide is None:
+            guide = build_center_guide_pixels(mask)
         stop_det, stop_y, stop_ratio = detect_stop_line_ipm(mask)
 
         with state.lock:
@@ -396,7 +447,7 @@ def image_cb(msg):
             state.lane_valid = guide is not None
             state.center_error = guide['center_error'] if guide else None
             state.heading_error_deg = guide['heading_error_deg'] if guide else None
-            state.dual_lane_valid = guide is not None and not guide.get('single', False)
+            state.dual_lane_valid = guide is not None and not guide.get('single', False) and guide.get('source') != 'pixel_fallback'
             state.entry_guide_valid = guide is not None
             state.stop_detected = stop_det
             state.stop_y_ipm = stop_y
@@ -406,14 +457,22 @@ def image_cb(msg):
         cv2.rectangle(overlay, (roi[0], roi[1]), (roi[2] - 1, roi[3] - 1), (255, 120, 0), 2)
         if guide is not None:
             pts = guide['overlay_points']
-            for i in range(0, len(pts) - 1, 2):
-                cv2.line(overlay, pts[i], pts[i + 1], (0, 255, 0), 4)
-            for fit_key in ('left_fit', 'right_fit'):
-                fit = guide.get(fit_key)
-                if fit is not None and fit.get('contour') is not None:
-                    cv2.drawContours(overlay, [fit['contour']], -1, (0, 255, 255), 3)
-            cv2.putText(overlay, 'CENTER GUIDE k=%.3f' % (guide['k'] if 'k' in guide else 0),
-                        (180, 40), cv2.FONT_HERSHEY_SIMPLEX, .5, (0, 255, 0), 2)
+            if guide.get('source') == 'pixel_fallback':
+                # 像素空间兜底中线：画连续折线（绿色）
+                if len(pts) > 1:
+                    cv2.polylines(overlay, [np.array(pts, np.int32)], False, (0, 255, 0), 3)
+                cv2.putText(overlay, 'PIXEL GUIDE centers=%d' % len(pts),
+                            (160, 40), cv2.FONT_HERSHEY_SIMPLEX, .5, (0, 255, 0), 2)
+            else:
+                # IPM 中线：画分段线
+                for i in range(0, len(pts) - 1, 2):
+                    cv2.line(overlay, pts[i], pts[i + 1], (0, 255, 0), 4)
+                for fit_key in ('left_fit', 'right_fit'):
+                    fit = guide.get(fit_key)
+                    if fit is not None and fit.get('contour') is not None:
+                        cv2.drawContours(overlay, [fit['contour']], -1, (0, 255, 255), 3)
+                cv2.putText(overlay, 'IPM GUIDE k=%.3f' % (guide['k'] if 'k' in guide else 0),
+                            (180, 40), cv2.FONT_HERSHEY_SIMPLEX, .5, (0, 255, 0), 2)
 
         # 停止线 overlay：画检测到的 IPM 底边（逆投影到图像）
         if stop_det and stop_y > 0:
