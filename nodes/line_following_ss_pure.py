@@ -59,6 +59,7 @@ LARGE_FOV_DURATION_AFTER_START = 2.5 # 软启动结束后，使用远视野持�
 CAMERA_TIMEOUT = 0.8
 
 # 停止线检测参数（外接矩形法）
+STOP_LINE_ROI_TOP_RATIO = 0.75     # 停止线检测区域限制为画面下方 25% (y 从 0.75*H 到 H)
 STOP_LINE_WIDTH_RATIO = 0.70       # 外接矩形宽度占比阈值（相对画面宽度）
 STOP_LINE_THIN_RATIO = 0.30        # 外接矩形高度/宽度比上限（保证细长）
 CREEP_SPEED = 0.12                 # 检测到停止线后的蠕动速度 (m/s)
@@ -316,11 +317,11 @@ def remove_horizontal_white_bands(bin_img, width_ratio=0.50, thin_ratio=STOP_LIN
     return clean
 
 
-def detect_stop_line(bin_img, width_ratio=STOP_LINE_WIDTH_RATIO, thin_ratio=STOP_LINE_THIN_RATIO):
-    """检测横跨画面的水平白线（停止线），外接矩形法。
+def detect_stop_line(bin_img, top_ratio=STOP_LINE_ROI_TOP_RATIO, width_ratio=STOP_LINE_WIDTH_RATIO, thin_ratio=STOP_LINE_THIN_RATIO):
+    """检测画面下方 25% 区域内的水平白线（停止线），外接矩形法。
 
-    先用横向开运算分离横向带（避免与车道线连通），再对外接矩形按
-    宽度占比 >= width_ratio 且高度/宽度 <= thin_ratio 判定。
+    仅在 y >= height * top_ratio (默认画面最下方 25%) 区域内检测，
+    先用横向开运算分离横向带，再对外接矩形按宽度占比 >= width_ratio 且高度/宽度 <= thin_ratio 判定。
     返回 (detected, rect_bottom_y)。
     """
     if bin_img is None or bin_img.size == 0:
@@ -328,7 +329,13 @@ def detect_stop_line(bin_img, width_ratio=STOP_LINE_WIDTH_RATIO, thin_ratio=STOP
     height, width = bin_img.shape
     if height == 0 or width == 0:
         return False, -1
-    horiz = extract_horizontal_bands(bin_img)
+
+    roi_y_start = int(height * top_ratio)
+    roi_bin = bin_img[roi_y_start:, :]
+    if roi_bin.size == 0:
+        return False, -1
+
+    horiz = extract_horizontal_bands(roi_bin)
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(horiz, 8)
     lowest_y = -1
     detected = False
@@ -336,8 +343,9 @@ def detect_stop_line(bin_img, width_ratio=STOP_LINE_WIDTH_RATIO, thin_ratio=STOP
         x, y, bw, bh, area = stats[label]
         if bw >= int(width * width_ratio) and bh <= bw * thin_ratio:
             detected = True
-            if y + bh > lowest_y:
-                lowest_y = int(y + bh)
+            y_in_full = y + bh + roi_y_start
+            if y_in_full > lowest_y:
+                lowest_y = int(y_in_full)
     return bool(detected), int(lowest_y)
 
 
