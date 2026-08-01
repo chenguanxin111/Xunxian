@@ -76,6 +76,9 @@ STOP_CONFIRM_FRAMES = 4          # 连续确认帧数
 STOP_MIN_AREA = 300
 STOP_KERNEL_W = 41               # 水平开运算核宽度（分离纯横向底边，滤除梯形腰）
 
+# ---- 中线提取 ----
+CENTER_ROI_BOTTOM = 0.75         # 中线提取只扫画面下方 25% 以上，避开黄色停止线等底部干扰
+
 # ---- IPM ----
 IPM_CENTER_X = 300.0
 IPM_LANE_HALF_WIDTH = 200.0
@@ -325,7 +328,8 @@ def build_center_guide_pixels(mask, contours=None, img_w=640, img_h=480):
 
     与 right_turn_trial.analyze_lanes 保持一致：
       - 取左右两侧最大的轮廓构建 clean_mask，再逐行扫描
-      - center_error 直接由中线点计算（无纵向跨度门槛）
+      - center_error 直接由中线点计算（无纵向跨度门槛，也无位置门槛——
+        小车偏离中心时中线本来就有偏移，正好用于纠偏）
       - heading 仅在纵向跨度足够时计算，否则视为 0
     """
     if contours is None:
@@ -342,8 +346,9 @@ def build_center_guide_pixels(mask, contours=None, img_w=640, img_h=480):
             cv2.drawContours(clean_mask, [right[0]], -1, 255, -1)
 
     roi_top = int(img_h * 0.45)
+    scan_bottom = int(img_h * CENTER_ROI_BOTTOM)
     centers_px = []
-    for y in range(img_h - 1, roi_top, -8):
+    for y in range(scan_bottom, roi_top, -8):
         xs = np.flatnonzero(clean_mask[y] > 0)
         if len(xs) == 0:
             continue
@@ -359,8 +364,8 @@ def build_center_guide_pixels(mask, contours=None, img_w=640, img_h=480):
     if len(centers_px) < 3:
         return None
 
-    # 合理性门控：防止把噪声/错误分组当成中线喂给控制造成乱开。
-    # 中线应平滑（X 方差小）且大致指向正前方（heading 小）。
+    # 合理性门控：中线应平滑（X 方差小）且大致指向正前方（heading 小）。
+    # 不做位置过滤——偏离中心时中心线本来就有偏移，过滤会挡住正常纠偏。
     if np.std([p[0] for p in centers_px]) > 45.0:
         return None
 
@@ -369,10 +374,6 @@ def build_center_guide_pixels(mask, contours=None, img_w=640, img_h=480):
     near_x = float(np.mean([p[0] for p in centers_px[:near_count]]))
     far_x = float(np.mean([p[0] for p in centers_px[-far_count:]]))
     center_error = near_x - img_w / 2.0
-    # 像素兜底只在近中心时作为“居中确认”，不充当远距追线目标，
-    # 否则路口两横向白带的中点在小车偏离中心时会误导（导致横向漂移）。
-    if abs(center_error) > 60.0:
-        return None
 
     near_y = float(np.mean([p[1] for p in centers_px[:near_count]]))
     far_y = float(np.mean([p[1] for p in centers_px[-far_count:]]))
@@ -442,7 +443,12 @@ def image_cb(msg):
             hsv_p = dict(state.hsv_params)
 
         mask, roi = make_mask(frame, hsv_p)
-        result = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+
+        # 中线提取专用掩膜：剔除画面下方 25%（底部黄色停止线/噪声不参与中线检测）
+        mask_center = mask.copy()
+        mask_center[int(mask.shape[0] * CENTER_ROI_BOTTOM):, :] = 0
+
+        result = cv2.findContours(mask_center, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
         contours = result[0] if len(result) == 2 else result[1]
         contours = [c for c in contours if cv2.contourArea(c) > 120 and cv2.arcLength(c, False) > 50]
         contours.sort(key=lambda c: cv2.contourArea(c), reverse=True)
@@ -450,7 +456,8 @@ def image_cb(msg):
         guide = build_center_guide_ipm(contours)
         # 当 IPM 无法拟合时（路口对面无纵向车道线），使用像素空间行扫描兜底
         if guide is None:
-            guide = build_center_guide_pixels(mask, contours)
+            guide = build_center_guide_pixels(mask_center, contours)
+        # 停止线检测仍用完整 mask（需要脚下底部信息）
         stop_det, stop_y, stop_ratio = detect_stop_line_ipm(mask)
 
         with state.lock:
