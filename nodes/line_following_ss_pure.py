@@ -50,6 +50,11 @@ LARGE_FOV_DURATION_AFTER_START = 2.5 # 软启动结束后，使用远视野持�
 # 摄像头无图像保护（秒）
 CAMERA_TIMEOUT = 0.8
 
+# 停止线检测参数
+STOP_LINE_RATIO = 0.75              # 单行白色像素占比阈值（横线横跨画面宽度比例）
+STOP_LINE_TRIGGER_FRACTION = 0.85   # 停止线底部位置触发比例（相对全图高度，越大停得越近）
+STOP_LINE_CONFIRM_FRAMES = 3        # 连续确认帧数，防止误检
+
 
 class SharedState:
     def __init__(self):
@@ -85,6 +90,12 @@ class SharedState:
         self.lost_frames = 0
         self.last_valid_time = 0.0
 
+        # 停止线检测状态
+        self.stop_line_detected = False
+        self.stop_line_y = -1
+        self.stop_line_hits = 0
+        self.stop_line_stopped = False
+
     def status(self):
         return {
             'mode': self.mode,
@@ -100,6 +111,10 @@ class SharedState:
             'vision_valid': self.vision_valid,
             'lost_frames': self.lost_frames,
             'image_age_s': round(max(0.0, time.time() - self.last_image_time), 2),
+            'stop_line_detected': self.stop_line_detected,
+            'stop_line_y': self.stop_line_y,
+            'stop_line_hits': self.stop_line_hits,
+            'stop_line_stopped': self.stop_line_stopped,
         }
 
 
@@ -249,9 +264,33 @@ def find_white_pixel_indices(img):
     return green_points, red_points, current_red_points_zuixiamian, vis, kanbujian
 
 
-def new_get_results(yuan_image, line_up_ratio=0.69):
+def detect_stop_line(bin_img, ratio_threshold=STOP_LINE_RATIO):
+    """检测横跨画面的水平白线（停止线）。
+
+    逐行统计白色像素占比，若某行占比超过 ratio_threshold 则认为该行属于
+    停止线。返回 (detected, lowest_y)，其中 lowest_y 是停止线所在行中最
+    靠下（离车最近）的一行的 y 坐标；detected 为 False 时 lowest_y 为 -1。
+    """
+    if bin_img is None or bin_img.size == 0:
+        return False, -1
+    height, width = bin_img.shape
+    if height == 0 or width == 0:
+        return False, -1
+    width_threshold = int(width * ratio_threshold)
+    lowest_y = -1
+    for y in range(height):
+        horizontal_pixels = np.sum(bin_img[y, :] == 255)
+        if horizontal_pixels > width_threshold:
+            lowest_y = y
+    return (lowest_y >= 0, lowest_y)
+
+
+def new_get_results(yuan_image, line_up_ratio=0.69, bin_img=None):
     line_low = 1.0
-    origin_img, bin_img, mask = new_get_yellow_lane_bin_img(yuan_image, HSV_PARAMS)
+    if bin_img is None:
+        origin_img, bin_img, mask = new_get_yellow_lane_bin_img(yuan_image, HSV_PARAMS)
+    else:
+        origin_img = cv2.resize(yuan_image, (pw, ph), interpolation=cv2.INTER_AREA)
     H = origin_img.shape[0]
     W = origin_img.shape[1]
     bin_img_rectangle_ROI = bin_img[int(H * line_up_ratio):int(H * line_low), :]
@@ -391,7 +430,11 @@ def image_cb(msg):
         else:
             roi_up = 0.60
 
-        green_points, red_points, roi_1, roi_2, current_red_points_zuixiamian, vis, kanbujian = new_get_results(frame, line_up_ratio=roi_up)
+        # 停止线检测（基于全画面二值图）
+        _, full_bin, _ = new_get_yellow_lane_bin_img(frame, HSV_PARAMS)
+        stop_detected, stop_y = detect_stop_line(full_bin)
+
+        green_points, red_points, roi_1, roi_2, current_red_points_zuixiamian, vis, kanbujian = new_get_results(frame, line_up_ratio=roi_up, bin_img=full_bin)
         angle_first_last, angle_first_middle, avg_last_3_x = calculate_metrics(green_points)
 
         if angle_first_middle > 0:
@@ -404,6 +447,13 @@ def image_cb(msg):
                     cv2.FONT_HERSHEY_SIMPLEX, .6, (0, 255, 255), 2)
         cv2.putText(overlay, f"error={error:.1f} deg  centers={len(green_points)}",
                     (10, 50), cv2.FONT_HERSHEY_SIMPLEX, .5, (255, 255, 255), 1)
+        # 停止线可视化：在触发线与检测线上画标记
+        trigger_y = int(ph * STOP_LINE_TRIGGER_FRACTION)
+        if stop_detected:
+            cv2.line(overlay, (0, stop_y), (pw - 1, stop_y), (0, 0, 255), 2)
+        cv2.line(overlay, (0, trigger_y), (pw - 1, trigger_y), (0, 255, 255), 1)
+        cv2.putText(overlay, f"STOPLINE: {stop_detected} y={stop_y} (trigger {trigger_y})", (10, 75),
+                    cv2.FONT_HERSHEY_SIMPLEX, .5, (0, 255, 255), 1)
 
         with state.lock:
             state.last_image_time = time.time()
@@ -423,6 +473,8 @@ def image_cb(msg):
                 state.lost_frames = 0
             else:
                 state.lost_frames += 1
+            state.stop_line_detected = stop_detected
+            state.stop_line_y = stop_y
 
         # 画面镜像翻转输出（满足显示器直观渲染要求）
         overlay_disp = cv2.flip(overlay, 1)
@@ -471,6 +523,21 @@ def control_timer(_event):
         err = state.error
         kanbujian = bool(state.kanbujian)
         current_red_bottom = state.current_red_points_zuixiamian
+
+        # 停止线检测：检测到横线且其最下沿已进入触发区（连续几帧确认）→ 刹停
+        trigger_y = int(ph * STOP_LINE_TRIGGER_FRACTION)
+        if state.stop_line_detected and state.stop_line_y >= trigger_y:
+            state.stop_line_hits += 1
+        else:
+            state.stop_line_hits = 0
+
+        if state.stop_line_hits >= STOP_LINE_CONFIRM_FRAMES:
+            state.mode = 'STOPPED'
+            state.message = '检测到停止线，已刹停'
+            state.stop_line_stopped = True
+            publish_stop()
+            rospy.loginfo("!!! 停止线已到达触发区，紧急刹停 !!!")
+            return
 
         vel, pid_message = compute_pid(err, kanbujian, current_red_bottom, state)
 
@@ -559,6 +626,8 @@ class Handler(BaseHTTPRequestHandler):
                 state.lost_frames = 0
                 state.start_time = time.time()
                 state.last_valid_time = time.time()
+                state.stop_line_hits = 0
+                state.stop_line_stopped = False
                 state.mode = 'RUNNING'
                 state.message = '纯巡线运行中'
                 self.reply({'ok': True})
