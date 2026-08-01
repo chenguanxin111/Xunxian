@@ -41,6 +41,7 @@ import numpy as np
 import rospy
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image
+from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Twist
 
 # 统一分辨率（与去年 ss.py pw=640, ph=360 一致）
@@ -57,10 +58,11 @@ LARGE_FOV_DURATION_AFTER_START = 2.5 # 软启动结束后，使用远视野持�
 # 摄像头无图像保护（秒）
 CAMERA_TIMEOUT = 0.8
 
-# 停止线检测参数
-STOP_LINE_RATIO = 0.75              # 单行白色像素占比阈值（横线横跨画面宽度比例）
-STOP_LINE_TRIGGER_FRACTION = 0.85   # 停止线底部位置触发比例（相对全图高度，越大停得越近）
-STOP_LINE_CONFIRM_FRAMES = 3        # 连续确认帧数，防止误检
+# 停止线检测参数（外接矩形法）
+STOP_LINE_WIDTH_RATIO = 0.70       # 外接矩形宽度占比阈值（相对画面宽度）
+STOP_LINE_THIN_RATIO = 0.30        # 外接矩形高度/宽度比上限（保证细长）
+CREEP_SPEED = 0.12                 # 检测到停止线后的蠕动速度 (m/s)
+CREEP_DISTANCE = 0.05              # 蠕动前进距离 (m)，5cm
 
 
 class SharedState:
@@ -104,6 +106,13 @@ class SharedState:
         self.stop_line_y = -1
         self.stop_line_hits = 0
         self.stop_line_stopped = False
+        self.creep_started = False
+        self.creep_start_x = 0.0
+        self.creep_start_y = 0.0
+
+        # odom
+        self.odom_x = 0.0
+        self.odom_y = 0.0
 
     def status(self):
         return {
@@ -273,25 +282,60 @@ def find_white_pixel_indices(img):
     return green_points, red_points, current_red_points_zuixiamian, vis, kanbujian
 
 
-def detect_stop_line(bin_img, ratio_threshold=STOP_LINE_RATIO):
-    """检测横跨画面的水平白线（停止线）。
+def extract_horizontal_bands(bin_img, kernel_w=31):
+    """用宽 x1 的水平核做开运算，分离横向白带（保留横向结构、消除纵向车道线）"""
+    if bin_img is None or bin_img.size == 0:
+        return bin_img
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_w, 1))
+    return cv2.morphologyEx(bin_img, cv2.MORPH_OPEN, kernel)
 
-    逐行统计白色像素占比，若某行占比超过 ratio_threshold 则认为该行属于
-    停止线。返回 (detected, lowest_y)，其中 lowest_y 是停止线所在行中最
-    靠下（离车最近）的一行的 y 坐标；detected 为 False 时 lowest_y 为 -1。
+
+def remove_horizontal_white_bands(bin_img, width_ratio=0.50, thin_ratio=STOP_LINE_THIN_RATIO, kernel_w=31):
+    """从二值图中剔除横向细长白色带（停止线），只保留纵向车道线。
+
+    先用横向开运算分离出横向带，再按外接矩形宽度/细长条件清除，
+    避免停止线与车道线相交连成一片导致过滤失效。
+    """
+    if bin_img is None or bin_img.size == 0:
+        return bin_img
+    h, w = bin_img.shape
+    if h == 0 or w == 0:
+        return bin_img
+    horiz = extract_horizontal_bands(bin_img, kernel_w)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(horiz, 8)
+    band_mask = np.zeros_like(bin_img)
+    for label in range(1, num_labels):
+        x, y, bw, bh, area = stats[label]
+        if bw >= int(w * width_ratio) and bh <= bw * thin_ratio:
+            band_mask[labels == label] = 255
+    clean = bin_img.copy()
+    clean[band_mask == 255] = 0
+    return clean
+
+
+def detect_stop_line(bin_img, width_ratio=STOP_LINE_WIDTH_RATIO, thin_ratio=STOP_LINE_THIN_RATIO):
+    """检测横跨画面的水平白线（停止线），外接矩形法。
+
+    先用横向开运算分离横向带（避免与车道线连通），再对外接矩形按
+    宽度占比 >= width_ratio 且高度/宽度 <= thin_ratio 判定。
+    返回 (detected, rect_bottom_y)。
     """
     if bin_img is None or bin_img.size == 0:
         return False, -1
     height, width = bin_img.shape
     if height == 0 or width == 0:
         return False, -1
-    width_threshold = int(width * ratio_threshold)
+    horiz = extract_horizontal_bands(bin_img)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(horiz, 8)
     lowest_y = -1
-    for y in range(height):
-        horizontal_pixels = np.sum(bin_img[y, :] == 255)
-        if horizontal_pixels > width_threshold:
-            lowest_y = y
-    return (lowest_y >= 0, lowest_y)
+    detected = False
+    for label in range(1, num_labels):
+        x, y, bw, bh, area = stats[label]
+        if bw >= int(width * width_ratio) and bh <= bw * thin_ratio:
+            detected = True
+            if y + bh > lowest_y:
+                lowest_y = y + bh
+    return detected, lowest_y
 
 
 def new_get_results(yuan_image, line_up_ratio=0.69, bin_img=None):
@@ -307,6 +351,8 @@ def new_get_results(yuan_image, line_up_ratio=0.69, bin_img=None):
     kernel_dilate = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
     bin_img_rectangle_ROI = cv2.erode(bin_img_rectangle_ROI, kernel_erode, iterations=1)
     bin_img_rectangle_ROI = cv2.dilate(bin_img_rectangle_ROI, kernel_dilate, iterations=2)
+    # 剔除横向停止线带，只保留纵向车道线，避免停止线被误匹配为车道线
+    bin_img_rectangle_ROI = remove_horizontal_white_bands(bin_img_rectangle_ROI)
     green_points, red_points, current_red_points_zuixiamian, vis, kanbujian = find_white_pixel_indices(bin_img_rectangle_ROI)
     return green_points, red_points, bin_img_rectangle_ROI, bin_img_rectangle_ROI, current_red_points_zuixiamian, vis, kanbujian
 
@@ -458,12 +504,10 @@ def image_cb(msg):
                     cv2.FONT_HERSHEY_SIMPLEX, .6, (0, 255, 255), 2)
         cv2.putText(overlay, f"error={error:.1f} deg  centers={len(green_points)}",
                     (10, 50), cv2.FONT_HERSHEY_SIMPLEX, .5, (255, 255, 255), 1)
-        # 停止线可视化：在触发线与检测线上画标记
-        trigger_y = int(ph * STOP_LINE_TRIGGER_FRACTION)
-        if stop_detected:
+        # 停止线可视化：在检测到的矩形底边上画标记
+        if stop_detected and stop_y >= 0:
             cv2.line(overlay, (0, stop_y), (pw - 1, stop_y), (0, 0, 255), 2)
-        cv2.line(overlay, (0, trigger_y), (pw - 1, trigger_y), (0, 255, 255), 1)
-        cv2.putText(overlay, f"STOPLINE: {stop_detected} y={stop_y} (trigger {trigger_y})", (10, 75),
+        cv2.putText(overlay, f"STOPLINE: {stop_detected} y={stop_y}", (10, 75),
                     cv2.FONT_HERSHEY_SIMPLEX, .5, (0, 255, 255), 1)
 
         # 仅显示时翻转（检测仍用未翻转图，与 ss.py 符号约定一致）；
@@ -474,7 +518,7 @@ def image_cb(msg):
                     cv2.FONT_HERSHEY_SIMPLEX, .6, (0, 255, 255), 2)
         cv2.putText(overlay_disp, f"error={error:.1f} deg  centers={len(green_points)}",
                     (10, 50), cv2.FONT_HERSHEY_SIMPLEX, .5, (255, 255, 255), 1)
-        cv2.putText(overlay_disp, f"STOPLINE: {stop_detected} y={stop_y} (trigger {trigger_y})", (10, 75),
+        cv2.putText(overlay_disp, f"STOPLINE: {stop_detected} y={stop_y}", (10, 75),
                     cv2.FONT_HERSHEY_SIMPLEX, .5, (0, 255, 255), 1)
 
         with state.lock:
@@ -519,6 +563,12 @@ def publish_stop():
         cmd_pub.publish(Twist())
 
 
+def odom_cb(data):
+    with state.lock:
+        state.odom_x = data.pose.pose.position.x
+        state.odom_y = data.pose.pose.position.y
+
+
 def control_timer(_event):
     with state.lock:
         now = time.time()
@@ -535,19 +585,33 @@ def control_timer(_event):
         kanbujian = bool(state.kanbujian)
         current_red_bottom = state.current_red_points_zuixiamian
 
-        # 停止线检测：检测到横线且其最下沿已进入触发区（连续几帧确认）→ 刹停
-        trigger_y = int(ph * STOP_LINE_TRIGGER_FRACTION)
-        if state.stop_line_detected and state.stop_line_y >= trigger_y:
-            state.stop_line_hits += 1
-        else:
-            state.stop_line_hits = 0
+        # 停止线检测：一旦检测到停止线，立即停止转向并进入蠕动状态
+        if state.stop_line_detected:
+            if not state.creep_started:
+                state.creep_started = True
+                state.creep_start_x = state.odom_x
+                state.creep_start_y = state.odom_y
+                rospy.loginfo("!!! 检测到停止线，开始蠕动 !!!")
 
-        if state.stop_line_hits >= STOP_LINE_CONFIRM_FRAMES:
-            state.mode = 'STOPPED'
-            state.message = '检测到停止线，已刹停'
-            state.stop_line_stopped = True
-            publish_stop()
-            rospy.loginfo("!!! 停止线已到达触发区，紧急刹停 !!!")
+            traveled = math.hypot(state.odom_x - state.creep_start_x,
+                                  state.odom_y - state.creep_start_y)
+            if traveled >= CREEP_DISTANCE:
+                state.mode = 'STOPPED'
+                state.message = '检测到停止线，蠕动到位，已刹停'
+                state.stop_line_stopped = True
+                publish_stop()
+                rospy.loginfo("!!! 蠕动 %.2fcm 完成，已刹停 !!!", traveled * 100)
+                return
+
+            # 蠕动：保持直线低速前进，不转向
+            vel_creep = Twist()
+            vel_creep.linear.x = CREEP_SPEED
+            vel_creep.linear.y = 0.0
+            vel_creep.angular.z = 0.0
+            state.command_linear_x = vel_creep.linear.x
+            state.command_linear_y = vel_creep.linear.y
+            state.command_angular_z = vel_creep.angular.z
+            cmd_pub.publish(vel_creep)
             return
 
         vel, pid_message = compute_pid(err, kanbujian, current_red_bottom, state)
@@ -661,6 +725,7 @@ class Handler(BaseHTTPRequestHandler):
                 state.last_valid_time = time.time()
                 state.stop_line_hits = 0
                 state.stop_line_stopped = False
+                state.creep_started = False
                 state.mode = 'RUNNING'
                 state.message = '纯巡线运行中'
                 self.reply({'ok': True})
@@ -715,6 +780,7 @@ def main():
     overlay_pub = rospy.Publisher('/line_following_ss/debug/overlay', Image, queue_size=1)
 
     rospy.Subscriber('/usb_cam/image_raw', Image, image_cb, queue_size=1, buff_size=2**24)
+    rospy.Subscriber('/odom', Odometry, odom_cb, queue_size=1)
     rospy.Timer(rospy.Duration(0.05), control_timer)  # 20Hz 控制循环
     rospy.on_shutdown(shutdown)
 
