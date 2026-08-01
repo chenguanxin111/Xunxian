@@ -8,8 +8,16 @@ aligns between two current-frame lane boundaries, and then stops.
 import json
 import math
 import os
+import sys
 import threading
 import time
+
+# 彻底屏蔽 Qt xcb 桌面显示器连接，防止在 SSH 环境下触发 Qt qFatal (SIGABRT) 终止程序
+os.environ["QT_QPA_PLATFORM"] = "offscreen"
+os.environ["OPENCV_UI_BACKEND"] = "HEADLESS"
+if "DISPLAY" in os.environ:
+    del os.environ["DISPLAY"]
+
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
@@ -138,6 +146,8 @@ class SharedState:
         self.control_source = 'STOPPED'
         self.command_linear_x = 0.0
         self.command_angular_z = 0.0
+        self.vis_overlay = None
+        self.vis_mask = None
 
     def status(self):
         return {
@@ -826,6 +836,8 @@ def image_cb(msg):
                            abs(dual_lane['heading_error_deg']) <= ALIGN_HEADING_TOL_DEG)
                 state.align_good_frames = state.align_good_frames + 1 if aligned else 0
 
+            state.vis_overlay = overlay
+            state.vis_mask = mask
             status = state.status()
 
         cv2.putText(overlay, 'STATE: %s' % status['mode'], (10, 25),
@@ -1042,9 +1054,8 @@ PAGE = '''<!doctype html><meta charset="utf-8"><title>右转车道驶入验证</
 <img id="img_overlay"><img id="img_mask">
 </section></main>
 <script>
-let host = window.location.hostname || '192.168.89.176';
-document.getElementById('img_overlay').src = 'http://' + host + ':8080/stream?topic=/right_turn/debug/overlay';
-document.getElementById('img_mask').src = 'http://' + host + ':8080/stream?topic=/right_turn/debug/mask';
+document.getElementById('img_overlay').src = '/stream/overlay';
+document.getElementById('img_mask').src = '/stream/mask';
 
 async function post(p){
     try {
@@ -1062,7 +1073,18 @@ setInterval(async()=>{try{document.getElementById('status').textContent=JSON.str
 
 class Handler(BaseHTTPRequestHandler):
     def reply(self, obj):
-        data = json.dumps(obj, ensure_ascii=False).encode('utf-8')
+        def default_converter(o):
+            if isinstance(o, (np.integer, np.int32, np.int64)):
+                return int(o)
+            elif isinstance(o, (np.floating, np.float32, np.float64)):
+                return float(o)
+            elif isinstance(o, np.ndarray):
+                return o.tolist()
+            elif isinstance(o, np.bool_):
+                return bool(o)
+            raise TypeError(f"Object of type {o.__class__.__name__} is not JSON serializable")
+
+        data = json.dumps(obj, default=default_converter, ensure_ascii=False).encode('utf-8')
         self.send_response(200)
         self.send_header('Content-Type', 'application/json; charset=utf-8')
         self.send_header('Content-Length', str(len(data)))
@@ -1070,16 +1092,35 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
-        if urlparse(self.path).path == '/':
+        path = urlparse(self.path).path
+        if path == '/':
             data = PAGE.encode('utf-8')
             self.send_response(200)
             self.send_header('Content-Type', 'text/html; charset=utf-8')
             self.send_header('Content-Length', str(len(data)))
             self.end_headers()
             self.wfile.write(data)
-        elif urlparse(self.path).path == '/api/status':
+        elif path == '/api/status':
             with state.lock:
                 self.reply(state.status())
+        elif path in ['/stream/overlay', '/stream/mask']:
+            self.send_response(200)
+            self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=frame')
+            self.end_headers()
+            while not rospy.is_shutdown():
+                with state.lock:
+                    img = state.vis_overlay if path == '/stream/overlay' else state.vis_mask
+                if img is not None:
+                    ret, jpeg = cv2.imencode('.jpg', img)
+                    if ret:
+                        try:
+                            self.wfile.write(b'--frame\r\n')
+                            self.wfile.write(b'Content-Type: image/jpeg\r\n\r\n')
+                            self.wfile.write(jpeg.tobytes())
+                            self.wfile.write(b'\r\n')
+                        except Exception:
+                            break
+                time.sleep(0.04)
         else:
             self.send_error(404)
 
