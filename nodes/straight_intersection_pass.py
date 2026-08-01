@@ -303,23 +303,8 @@ def build_center_guide_ipm(contours):
                         'y_max': y_near, 'lane_width': float(width),
                         'left_fit': a if ax < bx else b, 'right_fit': b if ax < bx else a}
     if best is None:
-        # 单条纵向线兜底：用固定半宽推算中线
-        long_fits = [f for f in fits if f['y_max'] - f['y_min'] >= 90.0]
-        if long_fits:
-            f = max(long_fits, key=lambda x: x['y_max'] - x['y_min'])
-            y_near = min(f['y_max'], 560.0)
-            x_edge = f['k'] * y_near + f['b']
-            # 判断是左线还是右线（相对 X=300 中心）
-            is_right = x_edge >= IPM_CENTER_X
-            x_mid = x_edge - IPM_LANE_HALF_WIDTH if is_right else x_edge + IPM_LANE_HALF_WIDTH
-            heading_deg = math.degrees(math.atan2(-f['k'], 1.0))
-            best = {'score': 99.0, 'k': f['k'], 'b': f['b'],
-                    'center_error': float(x_mid - IPM_CENTER_X),
-                    'heading_error_deg': float(heading_deg),
-                    'y_max': y_near, 'lane_width': None,
-                    'left_fit': None, 'right_fit': f if is_right else None,
-                    'single': True}
-    if best is None:
+        # 不采用单线 + 固定半宽推算中线：那会造出错误中线导致乱开。
+        # 参考 right_turn_trial.ALIGN_BETWEEN_LINES —— 只有真实成对平行线才有效。
         return None
     # 生成 overlay 中线点（逆投影回图像）
     y_values = np.linspace(best.get('y_min', 40.0), best['y_max'], 28)
@@ -374,11 +359,20 @@ def build_center_guide_pixels(mask, contours=None, img_w=640, img_h=480):
     if len(centers_px) < 3:
         return None
 
+    # 合理性门控：防止把噪声/错误分组当成中线喂给控制造成乱开。
+    # 中线应平滑（X 方差小）且大致指向正前方（heading 小）。
+    if np.std([p[0] for p in centers_px]) > 45.0:
+        return None
+
     near_count = min(5, len(centers_px))
     far_count = min(5, len(centers_px))
     near_x = float(np.mean([p[0] for p in centers_px[:near_count]]))
     far_x = float(np.mean([p[0] for p in centers_px[-far_count:]]))
     center_error = near_x - img_w / 2.0
+    # 像素兜底只在近中心时作为“居中确认”，不充当远距追线目标，
+    # 否则路口两横向白带的中点在小车偏离中心时会误导（导致横向漂移）。
+    if abs(center_error) > 60.0:
+        return None
 
     near_y = float(np.mean([p[1] for p in centers_px[:near_count]]))
     far_y = float(np.mean([p[1] for p in centers_px[-far_count:]]))
@@ -387,6 +381,8 @@ def build_center_guide_pixels(mask, contours=None, img_w=640, img_h=480):
         heading_deg = math.degrees(math.atan2(far_x - near_x, forward_px))
     else:
         heading_deg = 0.0
+    if abs(heading_deg) > 35.0:
+        return None
 
     overlay_points = list(centers_px)
     return {
@@ -629,7 +625,8 @@ def control_timer(_event):
                     cmd.angular.z = CENTER_KP_Z_ALIGN * center_error
                 else:
                     cmd.angular.z = 0.0
-                cmd.linear.y = CENTER_KP_Y * center_error * 0.5
+                # 对准完成后关闭横移：直行只走 y 方向，不再横向漂移
+                cmd.linear.y = 0.0
             else:
                 # 中线丢失：沿历史方向缓行，角度限幅
                 recent = state.straight_history_wz[-10:]
