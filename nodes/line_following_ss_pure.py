@@ -394,6 +394,8 @@ def compute_pid(error, kanbujian, current_red_points_zuixiamian, state):
 
 # ------------------ 可视化辅助 ------------------
 
+SHOW_GUI = '--show-gui' in sys.argv
+
 def draw_overlay(resize_img, green_points, red_points, roi_up):
     """将 ROI 中的绿/红点映射回 640x360 全图并叠加显示"""
     overlay = resize_img.copy()
