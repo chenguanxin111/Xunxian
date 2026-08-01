@@ -81,6 +81,8 @@ class SharedState:
         self.roi_1 = None
         self.roi_2 = None
         self.vis = None
+        self.vis_overlay = None
+        self.vis_mask = None
         self.roi_up = 0.69
 
         # 运动控制参数
@@ -464,11 +466,17 @@ def image_cb(msg):
         cv2.putText(overlay, f"STOPLINE: {stop_detected} y={stop_y} (trigger {trigger_y})", (10, 75),
                     cv2.FONT_HERSHEY_SIMPLEX, .5, (0, 255, 255), 1)
 
+        # 画面镜像翻转输出（满足显示器直观渲染要求）
+        overlay_disp = cv2.flip(overlay, 1)
+        mask_disp = cv2.flip(roi_1, 1)
+
         with state.lock:
             state.last_image_time = time.time()
             state.roi_1 = roi_1
             state.roi_2 = roi_2
             state.vis = vis
+            state.vis_overlay = overlay_disp
+            state.vis_mask = mask_disp
             state.roi_up = roi_up
             state.centers = green_points
             state.red_points = red_points
@@ -484,10 +492,6 @@ def image_cb(msg):
                 state.lost_frames += 1
             state.stop_line_detected = stop_detected
             state.stop_line_y = stop_y
-
-        # 画面镜像翻转输出（满足显示器直观渲染要求）
-        overlay_disp = cv2.flip(overlay, 1)
-        mask_disp = cv2.flip(roi_1, 1)
 
         if mask_pub is not None:
             mask_pub.publish(safe_cv2_to_imgmsg(mask_disp, 'mono8'))
@@ -563,12 +567,12 @@ PAGE = '''<!doctype html><meta charset="utf-8"><title>纯巡线控制台 (ss_pur
 <button onclick="post('/api/set_speed?speed=0.36')">0.36 m/s (去年原版速度)</button>
 </p>
 <pre id="status">加载状态中...</pre></section>
-<section><h3>识别叠加图 (/line_following_ss/debug/overlay) 与 二值图 (/line_following_ss/debug/mask)</h3>
+<section><h3>识别叠加图 (/stream/overlay) 与 二值图 (/stream/mask)</h3>
 <p><img id="img_overlay"><img id="img_mask"></p></section>
 </main>
 <script>
-document.getElementById('img_overlay').src = 'http://' + window.location.hostname + ':8080/stream?topic=/line_following_ss/debug/overlay';
-document.getElementById('img_mask').src = 'http://' + window.location.hostname + ':8080/stream?topic=/line_following_ss/debug/mask';
+document.getElementById('img_overlay').src = '/stream/overlay';
+document.getElementById('img_mask').src = '/stream/mask';
 async function post(url){
     try {
         let r = await fetch(url,{method:'POST'});
@@ -590,16 +594,35 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
-        if urlparse(self.path).path == '/':
+        path = urlparse(self.path).path
+        if path == '/':
             data = PAGE.encode('utf-8')
             self.send_response(200)
             self.send_header('Content-Type', 'text/html; charset=utf-8')
             self.send_header('Content-Length', str(len(data)))
             self.end_headers()
             self.wfile.write(data)
-        elif urlparse(self.path).path == '/api/status':
+        elif path == '/api/status':
             with state.lock:
                 self.reply(state.status())
+        elif path in ['/stream/overlay', '/stream/mask']:
+            self.send_response(200)
+            self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=frame')
+            self.end_headers()
+            while not rospy.is_shutdown():
+                with state.lock:
+                    img = state.vis_overlay if path == '/stream/overlay' else state.vis_mask
+                if img is not None:
+                    ret, jpeg = cv2.imencode('.jpg', img)
+                    if ret:
+                        try:
+                            self.wfile.write(b'--frame\r\n')
+                            self.wfile.write(b'Content-Type: image/jpeg\r\n\r\n')
+                            self.wfile.write(jpeg.tobytes())
+                            self.wfile.write(b'\r\n')
+                        except Exception:
+                            break
+                time.sleep(0.04)
         else:
             self.send_error(404)
 
