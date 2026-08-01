@@ -85,6 +85,7 @@ class SharedState:
         self.kanbujian = 0
         self.centers = []
         self.red_points = []
+        self.last_green_points = []
         self.current_red_points_zuixiamian = []
         self.roi_1 = None
         self.roi_2 = None
@@ -118,6 +119,8 @@ class SharedState:
         self.creep_angular_z = 0.0
         # 最近角速度历史（用于进入蠕动时取平均方向，避免单帧猛打方向）
         self.wz_history = []
+        # 视觉丢失降级蠕动
+        self.lost_creep_start = 0.0
 
         # odom
         self.odom_x = 0.0
@@ -447,9 +450,17 @@ def new_get_results(yuan_image, line_up_ratio=0.69, bin_img=None, recent_error_s
     return green_points, red_points, bin_img_rectangle_ROI, bin_img_rectangle_ROI, current_red_points_zuixiamian, vis, kanbujian
 
 
-def calculate_metrics(green_points):
+def calculate_metrics(green_points, last_green_points=None):
+    """计算中线割线角度。
+
+    green_points 不足 3 点时，优先用历史有效中线 last_green_points 回退
+    计算角度，避免返回 0 导致 error 变成 90° 伪误差。两者都不可用时返回 None。
+    """
     if len(green_points) < 3:
-        return 0.0, 0.0, 0.0
+        if last_green_points is not None and len(last_green_points) >= 3:
+            green_points = last_green_points
+        else:
+            return None, None, None
     first_point = green_points[0]
     last_point = green_points[-1]
     middle_point = green_points[len(green_points) // 2]
@@ -576,9 +587,13 @@ def image_cb(msg):
         stop_detected, stop_y = detect_stop_line(full_bin)
 
         green_points, red_points, roi_1, roi_2, current_red_points_zuixiamian, vis, kanbujian = new_get_results(frame, line_up_ratio=roi_up, bin_img=full_bin, recent_error_sign=prev_error_sign)
-        angle_first_last, angle_first_middle, avg_last_3_x = calculate_metrics(green_points)
+        angle_first_last, angle_first_middle, avg_last_3_x = calculate_metrics(green_points, state.last_green_points)
 
-        if angle_first_middle > 0:
+        if angle_first_middle is None:
+            # 视觉无效：保留上一帧 error，不产生 90° 伪误差
+            with state.lock:
+                error = state.error
+        elif angle_first_middle > 0:
             error = -90 + angle_first_middle
         else:
             error = 90 + angle_first_middle
@@ -619,7 +634,9 @@ def image_cb(msg):
             state.kanbujian = kanbujian
             state.raw_error = error
             state.error = error
-            state.vision_valid = len(green_points) >= 3
+            if len(green_points) >= 3:
+                state.last_green_points = list(green_points)
+            state.vision_valid = angle_first_middle is not None
             if state.vision_valid:
                 state.last_valid_time = state.last_image_time
                 state.lost_frames = 0
@@ -714,7 +731,35 @@ def control_timer(_event):
             cmd_pub.publish(vel_creep)
             return
 
+        # 视觉丢失：不产生 90° 伪误差猛打方向，按历史方向低速蠕动
+        if not state.vision_valid:
+            if state.lost_creep_start == 0.0:
+                state.lost_creep_start = now
+                rospy.logwarn("!!! 视觉丢失，按历史方向低速蠕动 !!!")
+            # 降级蠕动最长时间：2 秒，超时停车（防止一直迷路）
+            if now - state.lost_creep_start > 2.0:
+                state.mode = 'STOPPED'
+                state.message = '视觉持续丢失，已停车'
+                publish_stop()
+                return
+            recent = state.wz_history[-10:]
+            avg_wz = float(np.mean(recent)) if recent else 0.0
+            vel_lost = Twist()
+            vel_lost.linear.x = CREEP_SPEED
+            vel_lost.linear.y = 0.0
+            vel_lost.angular.z = max(-0.20, min(0.20, avg_wz))
+            state.command_linear_x = vel_lost.linear.x
+            state.command_linear_y = vel_lost.linear.y
+            state.command_angular_z = vel_lost.angular.z
+            rospy.loginfo_throttle(0.5, "视觉丢失蠕行: vx=%.2f, wz=%.2f (丢失%.1fs)",
+                                   vel_lost.linear.x, vel_lost.angular.z, now - state.lost_creep_start)
+            cmd_pub.publish(vel_lost)
+            return
+
         vel, pid_message = compute_pid(err, kanbujian, current_red_bottom, state)
+
+        # 视觉恢复：重置丢失蠕动计时
+        state.lost_creep_start = 0.0
 
         # 记录角速度历史（保留最近 10 帧，供进入蠕动时取平均方向）
         state.wz_history.append(float(vel.angular.z))
@@ -843,6 +888,7 @@ class Handler(BaseHTTPRequestHandler):
                 state.stop_line_stopped = False
                 state.creep_started = False
                 state.wz_history = []
+                state.lost_creep_start = 0.0
                 state.mode = 'RUNNING'
                 state.message = '纯巡线运行中'
                 self.reply({'ok': True})
