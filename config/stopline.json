@@ -1,0 +1,8 @@
+{
+  "stop_line_roi_top_ratio": 0.80,
+  "stop_line_width_ratio": 0.40,
+  "stop_line_thin_ratio": 0.40,
+  "creep_speed": 0.10,
+  "creep_distance": 0.10,
+  "camera_timeout": 0.8
+}

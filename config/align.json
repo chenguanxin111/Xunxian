@@ -1,0 +1,28 @@
+{
+  "speed": 0.04,
+  "center_tol_px": 18.0,
+  "heading_tol_deg": 12.0,
+  "confirm_frames": 10,
+  "kp_y": 0.0022,
+  "kp_z": 0.0015,
+  "wz_clamp": 0.10,
+  "max_distance": 0.40,
+  "timeout": 20.0,
+  "hsv": {
+    "low_h": 0,
+    "high_h": 179,
+    "low_s": 0,
+    "high_s": 45,
+    "low_v": 170,
+    "high_v": 255
+  },
+  "roi_top": 0.45,
+  "roi_bottom": 1.0,
+  "roi_left": 0.0,
+  "roi_right": 1.0,
+  "blur_ksize": 3,
+  "erode_iter": 0,
+  "erode_ksize": 3,
+  "dilate_iter": 2,
+  "dilate_ksize": 3
+}

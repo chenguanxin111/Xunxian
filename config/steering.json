@@ -1,0 +1,22 @@
+{
+  "kp_heading_lo": 0.8,
+  "kp_heading_mid": 0.8,
+  "kp_heading_hi": 0.75,
+  "hk1_deg": 5.0,
+  "hk2_deg": 10.0,
+  "hk3_deg": 18.0,
+  "kp_center": 0.018,
+  "kd_heading": 0.10,
+  "kd_center": 0.005,
+  "heading_spike_max_deg": 5.0,
+  "ema_h": 0.35,
+  "ema_c": 0.55,
+  "wz_slew": 3.0,
+  "wz_max": 0.55,
+  "speed_h_deg": 12.0,
+  "speed_k_deg": 0.004,
+  "kp_lat": 0.0,
+  "heading_bias_deg": 0.0,
+  "deadband_center_px": 3.0,
+  "deadband_heading_deg": 1.2
+}

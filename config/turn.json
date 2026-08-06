@@ -1,0 +1,16 @@
+{
+  "f_yaw_max_time": 0.6,
+  "f_yaw_tol_deg": 1.5,
+  "f_yaw_kp": 1.2,
+  "f_yaw_wz": 0.15,
+  "advance_speed": 0.15,
+  "advance_distance": 0.30,
+  "advance_timeout": 10.0,
+  "rotate_speed": 0.35,
+  "rotate_target_deg": 65.0,
+  "rotate_timeout": 12.0,
+  "search_rotate_wz": 0.15,
+  "search_accum_limit_deg": 85.0,
+  "search_timeout": 10.0,
+  "search_confirm_frames": 8
+}

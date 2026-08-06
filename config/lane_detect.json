@@ -1,0 +1,18 @@
+{
+  "roi_bottom_ratio": 0.30,
+  "min_center_pts": 3,
+  "min_center_span": 25.0,
+  "poly_max_resid": 20.0,
+  "lane_width_min": 110.0,
+  "lane_width_max": 230.0,
+  "lane_half_width": 84.0,
+  "max_slope_diff": 0.55,
+  "clean_min_h": 12,
+  "clean_min_area": 40,
+  "clean_min_ratio": 0.35,
+  "lookahead_px": 120.0,
+  "track_stale_frames": 10,
+  "max_width_dev": 35.0,
+  "max_cluster_w": 48,
+  "match_min_overlap": 18.0
+}
