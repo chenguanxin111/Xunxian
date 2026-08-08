@@ -54,6 +54,7 @@ class PolylineBehavior(Behavior):
         self.int_err = 0.0
         self.last_par_t = 0.0
         self.lane_good_frames = 0
+        self._near_straight = False
 
     # ---------- 状态复位 ----------
     def _reset_vision(self, ctx):
@@ -86,6 +87,7 @@ class PolylineBehavior(Behavior):
         self.radar_fallback_time = 0.0
         self.int_err = 0.0
         self.last_par_t = ctx.machine_time
+        self._near_straight = False
         self._ctrl_good_frames = 0
         self._set_poly_callbacks(ctx, use_wide=False, bias=0.0, stop_enabled=False)
         with ctx.lock:
@@ -97,12 +99,14 @@ class PolylineBehavior(Behavior):
         with ctx.lock:
             ctx.poly_roi['use_wide'] = bool(use_wide)
             ctx.poly_roi['bias'] = float(bias)
+            ctx.poly_roi['near_straight'] = bool(self._near_straight and self.phase == 'LINE_FOLLOW')
             ctx.poly_stop['enabled'] = bool(stop_enabled)
             ctx.poly_stop['enable_time'] = ctx.machine_time if stop_enabled else ctx.poly_stop['enable_time']
 
     # ---------- 巡线段工具 ----------
     def _enter_line_follow_from_turn(self, ctx, message):
         self.phase = 'LINE_FOLLOW'
+        self._near_straight = False
         self.line_follow_start_yaw = ctx.odom[2] if ctx.odom else 0.0
         self.y_turn_done = True
         self.roi_wide_remaining = 0
@@ -142,6 +146,7 @@ class PolylineBehavior(Behavior):
         """雷达异常 -> 复位视觉感知状态 -> 切回 LINE_FOLLOW。"""
         self._reset_vision(ctx)
         self.phase = 'LINE_FOLLOW'
+        self._near_straight = False
         self.line_follow_start_yaw = ctx.odom[2] if ctx.odom else 0.0
         self.y_turn_done = True
         self.roi_wide_remaining = 0
@@ -198,6 +203,7 @@ class PolylineBehavior(Behavior):
                                        odom[1] - self.advance_start_pose[1])
         if self.advance_dist >= cfg['advance_distance']:
             self.phase = 'LINE_FOLLOW'
+            self._near_straight = True
             self.line_follow_start_yaw = odom[2]
             self.roi_wide_remaining = cfg['roi_wide_frames_after_follow']
             self._set_poly_callbacks(ctx, use_wide=True, bias=cfg['lane_bias_right_px'], stop_enabled=False)
@@ -205,6 +211,7 @@ class PolylineBehavior(Behavior):
             return None, False
         if now - self.phase_started > cfg['advance_timeout']:
             self.phase = 'LINE_FOLLOW'
+            self._near_straight = True
             self.line_follow_start_yaw = odom[2]
             self.roi_wide_remaining = cfg['roi_wide_frames_after_follow']
             self._set_poly_callbacks(ctx, use_wide=True, bias=cfg['lane_bias_right_px'], stop_enabled=False)
@@ -214,6 +221,7 @@ class PolylineBehavior(Behavior):
             self._ctrl_good_frames += 1
             if self._ctrl_good_frames >= cfg['lane_stable_frames']:
                 self.phase = 'LINE_FOLLOW'
+                self._near_straight = True
                 self.line_follow_start_yaw = odom[2]
                 self.roi_wide_remaining = cfg['roi_wide_frames_after_follow']
                 self._set_poly_callbacks(ctx, use_wide=True, bias=cfg['lane_bias_right_px'], stop_enabled=False)

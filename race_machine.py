@@ -182,10 +182,12 @@ def image_cb(msg):
             full_mask, STOP_LINE_ROI_TOP_RATIO, STOP_LINE_WIDTH_RATIO, STOP_LINE_THIN_RATIO)
 
         # POLYLINE：ROI 宽紧 + lane_bias + 停止线 enable/delay 门控（由 PolylineBehavior 每帧写入）
+        near_straight = False
         if mode == MODE_POLYLINE:
             with ctx.lock:
                 proi = dict(ctx.poly_roi)
                 pstop = dict(ctx.poly_stop)
+            near_straight = bool(proi.get('near_straight', False))
             roi_ratio = (POLY_CFG['roi_wide_bottom_ratio'] if proi['use_wide']
                          else POLY_CFG['roi_tight_bottom_ratio'])
             tracker.lane_bias_px = proi['bias']
@@ -217,7 +219,7 @@ def image_cb(msg):
         warped = vision.warp_to_ipm(mask_roi)
         warped = vision.remove_horizontal_bands_ipm(warped, LANE_TUNE)
         cleaned = vision.clean_ipm_mask(warped, LANE_TUNE)
-        left_fit, right_fit, width_samples = vision.extract_raw_lanes(cleaned, LANE_TUNE)
+        left_fit, right_fit, width_samples = vision.extract_raw_lanes(cleaned, LANE_TUNE, near_straight=near_straight)
         result = vision.resolve_lane(tracker, left_fit, right_fit, width_samples, LANE_TUNE)
 
         if result is not None:

@@ -133,6 +133,36 @@ def fit_lane_line(points, tune):
             'y_max': float(np.max(pts[:, 1]))}
 
 
+def fit_lane_line_near(points, tune):
+    """近端直线段贪心截断拟合（POLYLINE 首个 LINE_FOLLOW 用）。
+
+    车道线弯曲只发生在远端（y 小），近端（y 大）永远是直线。
+    因此从近端向远端逐点贪心扩展，一旦整体拟合残差超过 poly_max_resid 就截断，
+    只保留近端连续直线段进入拟合，弯折尾部不参与计算，避免中线被偏折带歪。
+    """
+    pts = sorted(points, key=lambda p: p[1], reverse=True)
+    if len(pts) < tune['min_center_pts']:
+        return None
+    arr = np.asarray(pts, dtype=np.float64)
+    best_n = 0
+    for n in range(tune['min_center_pts'], len(arr) + 1):
+        sub = arr[:n]
+        k, b = np.polyfit(sub[:, 1], sub[:, 0], 1)
+        resid = np.max(np.abs(sub[:, 0] - (k * sub[:, 1] + b)))
+        if resid > tune['poly_max_resid']:
+            break
+        best_n = n
+    if best_n < tune['min_center_pts']:
+        return None
+    sub = arr[:best_n]
+    if np.ptp(sub[:, 1]) < tune['min_center_span']:
+        return None
+    k, b = np.polyfit(sub[:, 1], sub[:, 0], 1)
+    return {'coeffs': (0.0, float(k), float(b)),
+            'y_min': float(np.min(sub[:, 1])),
+            'y_max': float(np.max(sub[:, 1]))}
+
+
 def poly_x(coeffs, y):
     a, b, c = coeffs
     return a * y * y + b * y + c
@@ -171,8 +201,11 @@ def _find_sides_from_center(means, center):
     return left, right
 
 
-def extract_raw_lanes(warped, tune):
-    """逐行扫描提取左右车道线采样点并各自直线拟合。返回 (left_fit, right_fit, width_samples)。"""
+def extract_raw_lanes(warped, tune, near_straight=False):
+    """逐行扫描提取左右车道线采样点并各自直线拟合。返回 (left_fit, right_fit, width_samples)。
+
+    near_straight=True 时用 fit_lane_line_near（近端直线段贪心截断，POLYLINE 首段巡线用）。
+    """
     h, w = warped.shape
     center_canvas_x = IPM_CENTER_X - CANVAS_X0
     left_pts, right_pts = [], []
@@ -210,8 +243,9 @@ def extract_raw_lanes(warped, tune):
         elif right_x is not None:
             right_pts.append((float(right_x + CANVAS_X0), y_ipm))
 
-    left_fit = fit_lane_line(left_pts, tune)
-    right_fit = fit_lane_line(right_pts, tune)
+    fitter = fit_lane_line_near if near_straight else fit_lane_line
+    left_fit = fitter(left_pts, tune)
+    right_fit = fitter(right_pts, tune)
     return left_fit, right_fit, width_samples
 
 
