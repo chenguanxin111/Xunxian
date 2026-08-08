@@ -15,11 +15,13 @@ import tty
 import json
 import urllib.request
 
+import cv2
 import rospy
 import tf2_ros
 from geometry_msgs.msg import Twist, PoseWithCovarianceStamped
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import LaserScan, Imu
+from sensor_msgs.msg import LaserScan, Imu, Image
+from cv_bridge import CvBridge
 from tf.transformations import euler_from_quaternion
 
 
@@ -58,11 +60,12 @@ class LocalizationDiagnosticsV7:
             'map2odom_x', 'map2odom_y', 'map2odom_yaw',
             'particle_count',
             'scan_valid_pts', 'scan_near_ratio',
-            'lf_mode', 'lf_error_deg', 'lf_center_count', 'lf_kanbujian',
+            'lf_mode', 'lf_error_deg', 'lf_heading_error_deg', 'lf_center_error_px',
+            'lf_center_count', 'lf_kanbujian',
             'lf_vision_valid', 'lf_lane_tracks', 'lf_pair_valid',
             'lf_pair_slope_diff', 'lf_half_width', 'lf_half_width_samples',
             'lf_far_turn', 'lf_far_confidence', 'lf_far_points',
-            'lf_stop_line_detected', 'lf_stop_line_y', 'lf_creep_started', 'lf_stop_line_stopped',
+            'lf_stop_line_detected', 'lf_stop_line_y', 'lf_stop_line_enabled', 'lf_creep_started', 'lf_stop_line_stopped',
             'lf_image_age', 'wz_sign_flip_event'
         ]
         self.csv_writer.writerow(header)
@@ -77,6 +80,17 @@ class LocalizationDiagnosticsV7:
         self.icp_msg_age = -1.0
         self.icp_consecutive_frozen = 0
         self.prev_icp_pose = None
+
+        # 摄像头画面录制（用于排查停止线/巡线感知）
+        self.bridge = CvBridge()
+        self.latest_overlay = None
+        self.latest_mask = None
+        self.latest_raw = None
+        self.frame_dir = os.path.join(record_dir, f'frames_{timestamp}')
+        os.makedirs(self.frame_dir, exist_ok=True)
+        self.frame_count = 0
+        self.frame_save_interval = 0.1      # 每 0.1s 保存一帧（约10fps）
+        self.last_frame_save = 0.0
 
         self.imu_msg = None
         self.imu_last_stamp = rospy.Time(0)
@@ -99,15 +113,26 @@ class LocalizationDiagnosticsV7:
         rospy.Subscriber('/cmd_vel', Twist, self.cmd_vel_cb)
         rospy.Subscriber('/odom', Odometry, self.wheel_odom_cb)
         rospy.Subscriber('/icp_odom', Odometry, self.icp_odom_cb)
-        rospy.Subscriber('/imu/data', Imu, self.imu_cb)
+        rospy.Subscriber('/imu/physically_inverted', Imu, self.imu_cb)
         rospy.Subscriber('/amcl_pose', PoseWithCovarianceStamped, self.amcl_cb)
         rospy.Subscriber('/scan', LaserScan, self.scan_cb)
+
+        # 摄像头调试话题（polyline_following_ipm_0804 节点发布）
+        rospy.Subscriber('/polyline/debug/overlay', Image, self.overlay_cb, queue_size=1, buff_size=2**24)
+        rospy.Subscriber('/polyline/debug/mask', Image, self.mask_cb, queue_size=1, buff_size=2**24)
+        rospy.Subscriber('/usb_cam/image_raw', Image, self.raw_cb, queue_size=1, buff_size=2**24)
 
         # 定时器 20Hz 记录
         self.timer = rospy.Timer(rospy.Duration(0.05), self.timer_cb)
 
-        # 终端键盘监控
-        self.settings = termios.tcgetattr(sys.stdin)
+        # 终端键盘监控（stdin 不是 TTY 时跳过，避免 termios 崩溃，如 ssh 无 TTY / 管道）
+        self.keyboard_enabled = False
+        try:
+            if sys.stdin is not None and sys.stdin.isatty():
+                self.settings = termios.tcgetattr(sys.stdin)
+                self.keyboard_enabled = True
+        except Exception:
+            self.keyboard_enabled = False
 
         print("==================================================")
         print(f"[数据记录节点] 已启动！保存目录: {self.csv_path}")
@@ -135,6 +160,24 @@ class LocalizationDiagnosticsV7:
 
     def scan_cb(self, msg):
         self.latest_scan = msg
+
+    def overlay_cb(self, msg):
+        try:
+            self.latest_overlay = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
+        except Exception:
+            pass
+
+    def mask_cb(self, msg):
+        try:
+            self.latest_mask = self.bridge.imgmsg_to_cv2(msg, 'mono8')
+        except Exception:
+            pass
+
+    def raw_cb(self, msg):
+        try:
+            self.latest_raw = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
+        except Exception:
+            pass
 
     def _get_tf(self, target_frame, source_frame):
         try:
@@ -170,11 +213,11 @@ class LocalizationDiagnosticsV7:
             return 0
 
     def _poll_line_status(self, wall_time):
-        """轮询巡线 Web 状态；优先 5007 端口 (ss_pure)，备用 5004 端口 (node4)。"""
+        """轮询巡线 Web 状态；优先 5010 (polyline 0804)，备用 5007/5004。"""
         if wall_time - self.last_status_poll < 0.045:
             return self.line_status
         self.last_status_poll = wall_time
-        for port in [5007, 5004]:
+        for port in [5010, 5007, 5004]:
             try:
                 response = urllib.request.urlopen(
                     f'http://127.0.0.1:{port}/api/status', timeout=0.03
@@ -186,6 +229,8 @@ class LocalizationDiagnosticsV7:
         return self.line_status
 
     def _check_keyboard(self):
+        if not self.keyboard_enabled:
+            return True
         if select.select([sys.stdin], [], [], 0) == ([sys.stdin], [], []):
             tty.setraw(sys.stdin.fileno())
             key = sys.stdin.read(1)
@@ -355,6 +400,7 @@ class LocalizationDiagnosticsV7:
             pc,
             valid_pts, near_ratio,
             lf.get('mode', ''), lf.get('error_deg', ''),
+            lf.get('heading_error_deg', ''), lf.get('center_error_px', ''),
             lf.get('center_count', ''), int(bool(lf.get('kanbujian', False))),
             int(bool(lf.get('vision_valid', False))),
             lf.get('lane_track_count', ''), int(bool(lf.get('lane_pair_valid', False))),
@@ -362,15 +408,38 @@ class LocalizationDiagnosticsV7:
             lf.get('ipm_half_width_samples', ''),
             lf.get('far_turn_direction', ''), lf.get('far_turn_confidence', ''),
             lf.get('far_turn_points', ''),
-            int(stop_line), stop_y, int(creep), int(stop_stopped),
+            int(stop_line), stop_y, int(bool(lf.get('stop_line_enabled', False))), int(creep), int(stop_stopped),
             lf.get('image_age_s', ''), sign_flip,
         ]
         self.csv_writer.writerow(row)
         self.row_count += 1
 
+        # 定期保存摄像头画面（overlay 含检测到停止线的红线标注）
+        if wall_t - self.last_frame_save >= self.frame_save_interval:
+            self.last_frame_save = wall_t
+            self._save_frames(now_sec, stop_line, stop_y)
+
         if self.row_count % 20 == 0:
             self.csv_file.flush()
             print(f"\r[数据记录] 已记录 {self.row_count} 行 | cmd_vx={cvx:.2f} cmd_wz={cvw:.2f}", end='', flush=True)
+
+    def _save_frames(self, ros_sec, stop_line, stop_y):
+        """保存当前 overlay / mask / raw 三幅画面到 frames_ 目录。"""
+        try:
+            ts = f'{ros_sec:08.3f}'
+            tag = 'STOP' if stop_line else 'NO'
+            if self.latest_overlay is not None:
+                cv2.imwrite(os.path.join(self.frame_dir, f'f{self.frame_count:05d}_{ts}_{tag}_overlay.jpg'),
+                            self.latest_overlay)
+            if self.latest_mask is not None:
+                cv2.imwrite(os.path.join(self.frame_dir, f'f{self.frame_count:05d}_{ts}_{tag}_mask.jpg'),
+                            self.latest_mask)
+            if self.latest_raw is not None:
+                cv2.imwrite(os.path.join(self.frame_dir, f'f{self.frame_count:05d}_{ts}_{tag}_raw.jpg'),
+                            self.latest_raw)
+            self.frame_count += 1
+        except Exception as e:
+            rospy.logwarn_throttle(2, f"保存帧失败: {e}")
 
     def shutdown(self):
         self.csv_file.close()

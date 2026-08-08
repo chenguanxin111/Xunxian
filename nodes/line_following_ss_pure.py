@@ -60,7 +60,7 @@ LARGE_FOV_DURATION_AFTER_START = 2.5 # 软启动结束后，使用远视野持�
 CAMERA_TIMEOUT = 0.8
 
 # 停止线检测参数（外接矩形法）
-STOP_LINE_ROI_TOP_RATIO = 0.75     # 停止线检测区域限制为画面下方 25% (y 从 0.75*H 到 H)
+STOP_LINE_ROI_TOP_RATIO = 0.85     # 停止线检测区域限制为画面下方 25% (y 从 0.75*H 到 H)
 STOP_LINE_WIDTH_RATIO = 0.40       # 外接矩形宽度占比阈值（相对画面宽度）
 STOP_LINE_THIN_RATIO = 0.40        # 外接矩形高度/宽度比上限（保证细长）
 CREEP_SPEED = 0.10                 # 检测到停止线后的蠕动速度 (m/s)
@@ -503,7 +503,7 @@ def compute_pid(error, kanbujian, current_red_points_zuixiamian, state):
     """纯巡线 PID 控制（ss.py xunxian_2 的 else 分支，去掉转弯逻辑）"""
     pid_message = get_pid_message(error, kanbujian)
     if "看不见" in pid_message:
-        if "小大弯" in pid_message: kp_z, kp_y, kd_z = 0.024, 0.00005, 0.22
+        if "小大弯" in pid_message: kp_z, kp_y, kd_z = 0.022, 0.00005, 0.22
         elif "中弯" in pid_message: kp_z, kp_y, kd_z = 0.026, 0.00005, 0.2
         elif "极弯" in pid_message: kp_z, kp_y, kd_z = 0.029, 0.00005, 0.1
         elif "大极弯" in pid_message: kp_z, kp_y, kd_z = 0.033, 0.00005, 0.25
@@ -580,7 +580,7 @@ def image_cb(msg):
             prev_error_sign = np.sign(state.error) if state.error != 0 else 0
 
         # 车道线检测 ROI：固定取画面下方 40% (line_up_ratio = 0.60)
-        roi_up = 0.60
+        roi_up = 0.80
 
         # 停止线检测（基于全画面二值图）
         _, full_bin, _ = new_get_yellow_lane_bin_img(frame, HSV_PARAMS)

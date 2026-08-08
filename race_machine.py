@@ -383,6 +383,11 @@ def control_timer(_event):
     elif mode == MODE_ARC_FOLLOW:
         if ctx.odom is None:
             publish_stop()
+        elif radar.has_scan() and radar.min_dist() < POLY_CFG['min_safe_dist']:
+            mode = MODE_ESTOP
+            ctx.status['message'] = '雷达安全触发: too_close %.3f' % radar.min_dist()
+            publish_stop()
+            print('>> ESTOP: %s' % ctx.status['message'], flush=True)
         elif ctx.last_image_time == 0 or now - ctx.last_image_time > CAMERA_TIMEOUT:
             mode = MODE_FAULT
             ctx.status['message'] = '摄像头画面超时，紧急停车'

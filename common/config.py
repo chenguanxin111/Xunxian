@@ -54,7 +54,10 @@ def load_stopline():
     return _load('stopline.json', {
         'stop_line_roi_top_ratio': 0.80, 'stop_line_width_ratio': 0.40,
         'stop_line_thin_ratio': 0.40, 'creep_speed': 0.10,
-        'creep_distance': 0.10, 'camera_timeout': 0.8,
+        'creep_distance': 0.10, 'creep_timeout': 10.0, 'camera_timeout': 0.8,
+        'lost_creep_timeout': 2.0, 'search_rotate_wz': 0.35, 'search_confirm_frames': 8,
+        'search_first_sec': 5.0, 'search_first_deg': 75.0,
+        'search_second_sec': 6.0, 'search_second_deg': 90.0,
     })
 
 
@@ -93,8 +96,8 @@ def load_polyline():
         'roi_tight_bottom_ratio': 0.30, 'roi_wide_frames_after_follow': 15,
         'advance_roi_switch_dist': 0.30, 'lane_bias_right_px': 10.0,
         'camera_timeout': 0.8, 'creep_speed': 0.10,
-        'creep_distance': 0.10, 'lost_creep_timeout': 2.0,
-        'stop_line_enable_delay_sec': 1.0, 'left_yaw_limit_deg': 20.0,
+        'creep_distance': 0.10, 'creep_timeout': 10.0,
+        'lost_creep_timeout': 2.0, 'stop_line_enable_delay_sec': 1.0, 'left_yaw_limit_deg': 15.0,
         'turn_advance_speed': 0.131, 'turn_drive_wz': -0.29,
         'turn_yaw_deg': 47.0, 'turn_timeout': 25.0,
         'right_trust_nx_min': 340.0, 'right_trust_span_min': 60.0,
@@ -128,8 +131,9 @@ def load_park():
         'front_target': 0.17, 'front_tol': 0.015, 'side_target': 0.24,
         'side_min': 0.16, 'side_max': 0.34, 'ang_tol_deg': 15.0,
         'done_frames': 10, 'side_pre_dist': 0.25, 'pre_tol': 0.02,
-        'pre_vel': 0.15, 'kp_y': 2.0, 'pre_align_timeout': 5.0,
-        'vx_max': 0.15, 'vx_min': 0.06, 'kp_f': 0.35, 'kp_ang': 0.5,
+        'pre_vel': 0.15, 'kp_y': 2.0, 'pre_max_shift': 0.02,
+        'pre_align_timeout': 5.0,
+        'vx_max': 0.20, 'vx_min': 0.09, 'kp_f': 0.5, 'kp_ang': 0.5,
         'kp_side': 1.5, 'ki_side': 0.6, 's_int_max': 0.06,
         'wz_max': 0.35, 'wz_near_wall_start': 0.25,
         'wz_near_wall_end': 0.03, 'detect_creep': 0.08,

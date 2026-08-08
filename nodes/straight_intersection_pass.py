@@ -454,7 +454,7 @@ def image_cb(msg):
             frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         elif msg.encoding.lower() != 'bgr8':
             frame = bridge.imgmsg_to_cv2(msg, 'bgr8')
-        raw_frame = frame.copy()          # 翻转前原始相机帧（用于 IPM 鸟瞰）
+        raw_frame = frame.copy()          # 翻转前原始相机帧（IPM 标定基于此坐标系）
         frame = cv2.flip(frame, 1)
 
         with state.lock:
@@ -489,20 +489,35 @@ def image_cb(msg):
             state.stop_y_ipm = stop_y
             state.stop_width_ratio = stop_ratio
 
-        # 实时 IPM 鸟瞰图（原始相机帧经透视变换，供观察路口/入口几何）
-        if IPM_MATRIX is not None:
-            bird = cv2.warpPerspective(raw_frame, IPM_MATRIX, (600, 600))
-            cv2.rectangle(bird, (100, 0), (500, 600), (0, 255, 0), 1)
-            cv2.line(bird, (300, 0), (300, 600), (0, 0, 255), 1)
-            cv2.putText(bird, 'IPM X=100..500 lane, Y=600 feet', (8, 590),
-                        cv2.FONT_HERSHEY_SIMPLEX, .4, (0, 255, 255), 1)
-            if guide is not None and guide.get('source') != 'pixel_fallback' and 'k' in guide:
-                y_vals = np.linspace(guide.get('y_min', 40.0), guide['y_max'], 20)
-                ipm_line = np.float32([[guide['k'] * y + guide['b'], y] for y in y_vals]).reshape(-1, 1, 2)
-                bird_pts = ipm_line.reshape(-1, 2).astype(int)
-                for i in range(len(bird_pts) - 1):
-                    cv2.line(bird, tuple(bird_pts[i]), tuple(bird_pts[i + 1]), (0, 255, 0), 2)
-        else:
+        # 实时显示小车内部真实计算用的 IPM 空间（perspective_params 标定：
+        # 600×600，lane X=100..500，Y=600=脚边）。叠加掩膜与检测到的中线。
+        try:
+            if IPM_MATRIX is None:
+                bird = None
+            else:
+                bird = cv2.warpPerspective(raw_frame, IPM_MATRIX, (600, 600))
+                # 掩膜在翻转坐标系下，先镜像还原回原始相机坐标系再进 IPM 空间
+                rm = mask[:, ::-1]
+                bm = cv2.warpPerspective(rm, IPM_MATRIX, (600, 600),
+                                         flags=cv2.INTER_NEAREST)
+                if np.any(bm):
+                    green = np.zeros_like(bird)
+                    green[:] = (0, 255, 0)
+                    blend = cv2.addWeighted(bird, 0.5, green, 0.5, 0)
+                    bird = np.where(bm[..., None] > 0, blend, bird)
+                cv2.rectangle(bird, (100, 0), (500, 600), (0, 255, 0), 1)
+                cv2.line(bird, (300, 0), (300, 600), (0, 0, 255), 1)
+                cv2.putText(bird, 'IPM internal X=100..500 lane, Y=600 feet', (8, 590),
+                            cv2.FONT_HERSHEY_SIMPLEX, .4, (0, 255, 255), 1)
+                if guide is not None and guide.get('overlay_points'):
+                    pts = np.float32([[639.0 - p[0], p[1]]
+                                      for p in guide['overlay_points']])
+                    dp = cv2.perspectiveTransform(pts.reshape(-1, 1, 2),
+                                                  IPM_MATRIX).reshape(-1, 2)
+                    disp_pts = [(int(round(x)), int(round(y))) for x, y in dp]
+                    if len(disp_pts) > 1:
+                        cv2.polylines(bird, [np.array(disp_pts, np.int32)], False, (0, 255, 255), 2)
+        except Exception:
             bird = None
         with state.lock:
             state.vis_ipm = bird

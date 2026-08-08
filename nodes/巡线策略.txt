@@ -1,0 +1,6 @@
+1. 对齐程序（暂未分离出来）
+2. 红绿灯方向识别程序（待实现）
+3.1.1 路口左转/右转程序（simple_turn_trial.py）
+3.1.2 弧线车道巡线程序(line_following_ss_pure_ipm.py)
+3.2 折线车道巡线程序(polyline_following_hybrid.py视觉激光混合方案、polyline_following_ipm_0804.py纯视觉方案)
+4. 停车程序(corner_parking_lidar.py)

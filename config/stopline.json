@@ -1,8 +1,16 @@
 {
-  "stop_line_roi_top_ratio": 0.80,
-  "stop_line_width_ratio": 0.40,
-  "stop_line_thin_ratio": 0.40,
-  "creep_speed": 0.10,
-  "creep_distance": 0.10,
-  "camera_timeout": 0.8
+  "stop_line_roi_top_ratio": 0.8,
+  "stop_line_width_ratio": 0.4,
+  "stop_line_thin_ratio": 0.4,
+  "creep_speed": 0.1,
+  "creep_distance": 0.1,
+  "creep_timeout": 10.0,
+  "camera_timeout": 0.8,
+  "lost_creep_timeout": 2.0,
+  "search_rotate_wz": 0.35,
+  "search_confirm_frames": 8,
+  "search_first_sec": 5.0,
+  "search_first_deg": 75.0,
+  "search_second_sec": 6.0,
+  "search_second_deg": 90.0
 }

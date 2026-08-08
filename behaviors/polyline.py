@@ -45,6 +45,7 @@ class PolylineBehavior(Behavior):
         self.stop_line_enable_time = 0.0
         self.creep_started = False
         self.creep_start_pose = None
+        self.creep_start_t = 0.0
         self.creep_angular_z = 0.0
         self.y_turn_done = False
         self.radar_ready_frames = 0
@@ -77,6 +78,7 @@ class PolylineBehavior(Behavior):
         self.stop_line_enable_time = 0.0
         self.creep_started = False
         self.creep_start_pose = None
+        self.creep_start_t = 0.0
         self.creep_angular_z = 0.0
         self.y_turn_done = False
         self.radar_ready_frames = 0
@@ -235,11 +237,15 @@ class PolylineBehavior(Behavior):
             if not self.creep_started:
                 self.creep_started = True
                 self.creep_start_pose = odom
+                self.creep_start_t = now
                 self.creep_angular_z = max(-0.15, min(0.15, self.last_wz))
             traveled = 0.0
             if self.creep_start_pose is not None:
                 traveled = math.hypot(odom[0] - self.creep_start_pose[0],
                                       odom[1] - self.creep_start_pose[1])
+            if now - self.creep_start_t > cfg['creep_timeout']:
+                ctx.status['message'] = 'POLYLINE: 检测到停止线，蠕动超时(%.0fs)未走完，停车' % cfg['creep_timeout']
+                return cmd, MODE_FAULT
             if traveled >= cfg['creep_distance']:
                 ctx.status['message'] = 'POLYLINE: 检测到停止线，蠕动到位，停车'
                 return cmd, MODE_PARK

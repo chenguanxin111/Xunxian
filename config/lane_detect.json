@@ -1,5 +1,5 @@
 {
-  "roi_bottom_ratio": 0.30,
+  "roi_bottom_ratio": 0.3,
   "min_center_pts": 3,
   "min_center_span": 25.0,
   "poly_max_resid": 20.0,

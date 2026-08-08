@@ -34,6 +34,7 @@ class ParkBehavior(Behavior):
         self.detect_t0 = 0.0
         self.pre_t0 = 0.0
         self.pre_lost_t = 0.0
+        self.pre_start_pose = None
         self.done_frames = 0
         self.scan_wait_t0 = 0.0
         self.done_reported = False
@@ -49,6 +50,7 @@ class ParkBehavior(Behavior):
         self.detect_t0 = ctx.machine_time if self.phase == 'DETECT' else 0.0
         self.pre_t0 = 0.0
         self.pre_lost_t = 0.0
+        self.pre_start_pose = None
         self.done_frames = 0
         self.scan_wait_t0 = ctx.machine_time
         self.done_reported = False
@@ -104,12 +106,21 @@ class ParkBehavior(Behavior):
         self.done_frames = 0
         ctx.status['message'] = msg
 
+    def _pre_shift(self, ctx):
+        """PRE_ALIGN 开始以来的横向位移（odom 投影到起始车头法向）。"""
+        if ctx.odom is None or self.pre_start_pose is None:
+            return 0.0
+        dx = ctx.odom[0] - self.pre_start_pose[0]
+        dy = ctx.odom[1] - self.pre_start_pose[1]
+        yaw0 = self.pre_start_pose[2]
+        return abs(-dx * math.sin(yaw0) + dy * math.cos(yaw0))
+
     def step(self, ctx, now):
         cfg = self.cfg
         cmd = ctx.make_twist()
 
         guard = self._guard(now)
-        if guard is not None:
+        if guard is not None and self.phase != 'WAIT_SCAN':
             ctx.status['message'] = 'PARK 安全停: %s' % guard
             return cmd, MODE_ESTOP
 
@@ -156,6 +167,7 @@ class ParkBehavior(Behavior):
                     self.phase = 'PRE_ALIGN'
                     self.pre_t0 = now
                     self.pre_lost_t = 0.0
+                    self.pre_start_pose = ctx.odom
                     ctx.status['message'] = 'PARK->PRE_ALIGN side=%s perp=%.3f' % (sd, fw['perp'])
                 else:
                     self._start_drive(ctx, 'PARK->DRIVE side=%s perp=%.3f' % (sd, fw['perp']))
@@ -165,6 +177,9 @@ class ParkBehavior(Behavior):
             fw = self._side_fit(lw, rw)
             dt = max(0.0001, now - self.last_s_t)
             self.last_s_t = now
+            if self._pre_shift(ctx) >= cfg['pre_max_shift']:
+                self._start_drive(ctx, 'PARK->DRIVE prealign-shift-cap(%.0fmm)' % (cfg['pre_max_shift'] * 1000))
+                return cmd, None
             if fw is None:
                 self.pre_lost_t += dt
                 cmd.linear.x = 0.0

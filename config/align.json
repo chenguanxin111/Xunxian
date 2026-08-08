@@ -5,8 +5,8 @@
   "confirm_frames": 10,
   "kp_y": 0.0022,
   "kp_z": 0.0015,
-  "wz_clamp": 0.10,
-  "max_distance": 0.40,
+  "wz_clamp": 0.1,
+  "max_distance": 0.4,
   "timeout": 20.0,
   "hsv": {
     "low_h": 0,

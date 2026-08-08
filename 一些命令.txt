@@ -10,6 +10,8 @@ catkin_make -DCATKIN_WHITELIST_PACKAGES="ucar_controller;ydlidar;ucar_map;ucar_n
 启动底盘：
 source ~/ucar26_ws/devel/setup.bash
 roslaunch ucar_controller base_driver.launch
+启动激光雷达
+roslaunch ydlidar ydlidar.launch
 启动键盘控制：
 source /opt/ros/noetic/setup.bash
 source ~/ucar26_ws/devel/setup.bash

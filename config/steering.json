@@ -6,7 +6,7 @@
   "hk2_deg": 10.0,
   "hk3_deg": 18.0,
   "kp_center": 0.018,
-  "kd_heading": 0.10,
+  "kd_heading": 0.1,
   "kd_center": 0.005,
   "heading_spike_max_deg": 5.0,
   "ema_h": 0.35,

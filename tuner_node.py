@@ -12,17 +12,18 @@ from cv_bridge import CvBridge
 from sensor_msgs.msg import Image
 
 BASE_DIR = '/home/ucar/Xunxian_standalone'
-DEFAULT_SAVE_PATH = os.path.join(BASE_DIR, 'hsv_params.json')
+CONFIG_DIR = os.path.join(BASE_DIR, 'config')
+DEFAULT_SAVE_PATH = os.path.join(CONFIG_DIR, 'white_lane.json')
 
 PRESET_PROFILES = {
     'white_lane': {
         'name': '白色车道线',
-        'low_h': 0, 'high_h': 179,
-        'low_s': 0, 'high_s': 45,
-        'low_v': 170, 'high_v': 255,
+        'low_h': 42, 'high_h': 179,
+        'low_s': 5, 'high_s': 71,
+        'low_v': 116, 'high_v': 255,
         'roi_top': 0.45, 'roi_bottom': 1.0,
         'roi_left': 0.0, 'roi_right': 1.0,
-        'blur_ksize': 3, 'erode_iter': 1, 'erode_ksize': 3, 'dilate_iter': 2, 'dilate_ksize': 3
+        'blur_ksize': 4, 'erode_iter': 0, 'erode_ksize': 3, 'dilate_iter': 2, 'dilate_ksize': 3
     },
     'yellow_line': {
         'name': '黄色停止线',
@@ -435,7 +436,7 @@ class Handler(BaseHTTPRequestHandler):
             with state.lock:
                 self.reply(state.info)
         elif path == '/api/files':
-            files = [f for f in os.listdir(BASE_DIR) if f.endswith('.json')]
+            files = [f for f in os.listdir(CONFIG_DIR) if f.endswith('.json')]
             files.sort()
             self.reply({'files': files, 'presets': list(PRESET_PROFILES.keys())})
         else:
@@ -462,10 +463,10 @@ class Handler(BaseHTTPRequestHandler):
         elif path == '/api/save':
             n = int(self.headers.get('Content-Length', 0))
             data = json.loads(self.rfile.read(n)) if n > 0 else {}
-            filename = data.get('filename', 'hsv_params.json')
+            filename = data.get('filename', 'white_lane.json')
             if not filename.endswith('.json'):
                 filename += '.json'
-            target_path = os.path.join(BASE_DIR, os.path.basename(filename))
+            target_path = os.path.join(CONFIG_DIR, os.path.basename(filename))
             with state.lock:
                 with open(target_path, 'w') as f:
                     json.dump(state.params, f, indent=2)
@@ -482,7 +483,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply({'ok': True, 'params': state.params})
             elif 'filename' in data:
                 filename = os.path.basename(data['filename'])
-                target_path = os.path.join(BASE_DIR, filename)
+                target_path = os.path.join(CONFIG_DIR, filename)
                 if os.path.exists(target_path):
                     with state.lock:
                         with open(target_path, 'r') as f:
